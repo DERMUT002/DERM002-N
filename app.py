@@ -152,7 +152,8 @@ def build_news_event_telegram(event, results, now):
         if sig in ('BUY', 'SELL'):
             sig_emoji = "🟢" if sig == 'BUY' else "🔴"
             model_used = _escape_telegram_html(a.get('model_used', PYTHON_FALLBACK_MODEL))
-            lines.append(f"{sig_emoji} <b>{symbol_escaped}</b>: {_escape_telegram_html(sig)} | Model: {model_used}")
+            signal_label = f"{sig} LEAN" if event.get('analysis_phase') != 'POST_RELEASE' else sig
+            lines.append(f"{sig_emoji} <b>{symbol_escaped}</b>: {_escape_telegram_html(signal_label)} | Model: {model_used}")
             hist_pattern = a.get('historical_pattern', '')
             reason = (a.get('reasoning') or '').strip()
             reason_escaped = _escape_telegram_html(reason)
@@ -160,6 +161,8 @@ def build_news_event_telegram(event, results, now):
                 lines.append(f"📚 Historical: {_escape_telegram_html(hist_pattern)}")
             if reason_escaped:
                 lines.append(f"🧠 {reason_escaped}")
+            if event.get('analysis_phase') != 'POST_RELEASE' and a.get('conditional_scenarios'):
+                lines.append(f"🔀 Conditional scenarios: {_escape_telegram_html(a['conditional_scenarios'])}")
             lines.append("")
         elif sig == 'WAIT':
             model_used = _escape_telegram_html(a.get('model_used', PYTHON_FALLBACK_MODEL))
@@ -1577,6 +1580,47 @@ def fetch_news_historical_context(event):
         pass
     return None
 
+def build_gold_macro_context(ttl_seconds=3600):
+    if not get_secret("FRED_API_KEY", "").strip():
+        return "FRED Treasury-yield context unavailable; configure FRED_API_KEY to include official 2-year and 10-year real-yield observations."
+
+    cache_key = "_gold_macro_context_cache"
+    now = datetime.now()
+    cached = st.session_state.get(cache_key)
+    if cached and (now - cached.get("fetched_at", now)).total_seconds() < ttl_seconds:
+        return cached.get("text", "")
+
+    series = {"2-year Treasury yield": "DGS2", "10-year real Treasury yield": "DFII10"}
+    with ThreadPoolExecutor(max_workers=len(series)) as executor:
+        futures = {label: executor.submit(fetch_fred_observations, series_id, 2) for label, series_id in series.items()}
+
+    lines = []
+    for label, future in futures.items():
+        try:
+            observations = future.result()
+        except Exception:
+            observations = None
+        if not observations:
+            lines.append(f"{label}: unavailable")
+            continue
+        latest = observations[0]
+        line = f"FRED {series[label]} {label}: {latest['value']:.3f}% for {latest['date']}"
+        if len(observations) > 1:
+            previous = observations[1]
+            change = latest['value'] - previous['value']
+            line += f"; prior {previous['value']:.3f}% on {previous['date']}; change {change:+.3f} percentage points"
+        try:
+            age_days = (datetime.now(timezone.utc).date() - datetime.strptime(latest['date'], "%Y-%m-%d").date()).days
+            if age_days > 5:
+                line += f"; STALE ({age_days} days old)"
+        except (TypeError, ValueError):
+            line += "; observation age unavailable"
+        lines.append(line)
+
+    context = "Official rate context (daily data; not intraday): " + "; ".join(lines)
+    st.session_state[cache_key] = {"text": context, "fetched_at": now}
+    return context
+
 # ── News Fetching ────────────────────────────────────────────────────────
 def get_high_impact_news(selected_symbols=None, reference_dt=None):
     now = datetime.now(timezone.utc)
@@ -1657,8 +1701,8 @@ ANALYSIS ORDER:
 - Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
 - Macro transmission: explain how this event and the supplied data may alter Fed/rate expectations, yields, and USD; distinguish a likely tendency from a certain outcome. For unreleased events, assess the most likely direction from available expectations and context, but explicitly say when the release outcome itself is unknown.
 - Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
-- Decision: never force a direction. For PRE_RELEASE, the outcome and surprise are unknown: return WAIT and explain conditional above/below-consensus scenarios without choosing a trade direction. For POST_RELEASE, return BUY or SELL only when the supplied actual and forecast are both present and comparable, the surprise direction is clear for this indicator, the likely USD impact and this instrument's effect are unambiguous, confidence is MEDIUM or HIGH, and directional evidence supports the chosen side. Otherwise return WAIT and identify the missing or conflicting evidence. Technical structure may contextualize a news reaction but must not be used to manufacture a news-driven direction. Do not provide entry, stop-loss, or take-profit prices.
-- Reasoning: for BUY or SELL, cite the supplied release values, likely USD channel, instrument mapping, confirming evidence, and strongest caveat. For WAIT, state why the evidence gate failed and describe conditional scenarios without implying a chosen direction. Never invent sources or values.
+- Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Before release, the actual surprise is unknown, but when market data exists select BUY or SELL as a low-confidence directional lean based on the supplied gold trend, DXY, rates, forecast-versus-previous context, and event transmission. Do not describe that lean as a prediction of the actual result; explain that the scenarios can reverse it. Use WAIT only if no directional market evidence is available. After release, return BUY or SELL only when actual and forecast are present and comparable, the surprise direction is clear for this indicator, the likely USD impact and gold effect are supported, and directional evidence confirms the side. Otherwise return WAIT and identify the missing or conflicting evidence. Do not provide entry, stop-loss, or take-profit prices.
+- Reasoning: for a PRE_RELEASE lean, identify it as a market-context bias, cite available data and uncertainty, and include conditional scenarios. For POST_RELEASE, cite actual, forecast, surprise, likely USD/rates channel, gold reaction evidence, and the strongest caveat. For WAIT, state why evidence is insufficient. Never invent sources or values.
 
 DATA PROVIDED:
 {data_summary}
@@ -1678,6 +1722,8 @@ DXY (US Dollar Index) TREND:
 {dxy_data}
 RELEASE AND HISTORICAL DATA:
 {historical_context}
+OFFICIAL TREASURY-YIELD CONTEXT (check observation dates and staleness):
+{gold_macro_context}
 NEWS EVENT DETAILS:
 {news_summary}
 STRUCTURAL SCORE (PYTHON):
@@ -1931,7 +1977,18 @@ def enforce_news_signal_gate(analysis, event):
     phase = event.get('analysis_phase', 'PRE_RELEASE')
     reason = None
     if phase != 'POST_RELEASE':
-        reason = 'Pre-release outcome is unknown; review conditional scenarios and wait for actual data.'
+        if signal not in {'BUY', 'SELL'}:
+            signal = normalize_ai_signal(analysis.get('market_context_direction'))
+        if signal not in {'BUY', 'SELL'}:
+            reason = 'No directional market evidence is available for a pre-release lean.'
+        else:
+            analysis['signal'] = signal
+            analysis['bias'] = 'BULLISH' if signal == 'BUY' else 'BEARISH'
+            analysis['direction_type'] = 'PRE_RELEASE_LEAN'
+            analysis['confidence'] = 'LOW'
+            analysis['decision_gate_reason'] = 'Directional lean reflects current market context, not knowledge of the unreleased result.'
+            analysis['rejection_reason'] = ''
+            return analysis
     elif not has_reported_value(event.get('actual')) or not has_reported_value(event.get('forecast')):
         reason = 'Actual and consensus forecast are both required to assess the release surprise.'
     elif not are_comparable_news_values(event.get('actual'), event.get('forecast')):
@@ -2054,6 +2111,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
         historical_context = fetch_news_historical_context(event)
         if not historical_context:
             historical_context = build_historical_context(m10)
+        gold_macro_context = build_gold_macro_context()
         
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
         
@@ -2076,6 +2134,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
             'htf_context': htf_summary,
             'dxy_data': dxy_summary,
             'historical_context': historical_context,
+            'gold_macro_context': gold_macro_context,
             'news_summary': news_summary,
             'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger,
@@ -2102,6 +2161,8 @@ def analyze_news_for_symbol(symbol, all_data, event):
         analysis['atr'] = setup_context.get('atr')
         analysis['score_reason'] = structural_context['score_reason']
         analysis['candidate_direction'] = structural_context['candidate_direction']
+        analysis['market_context_direction'] = firm or ledger.get('direction') or structural_context.get('candidate_direction')
+        analysis['gold_macro_context'] = gold_macro_context
         analysis['is_news_signal'] = True
         
         if analysis.get('api_status') not in ['SUCCESS', 'SUCCESS_EXTRACTED']:
@@ -2123,6 +2184,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
                 analysis['groq_raw_output'] = groq_raw_output
             analysis['estimated_tokens'] = analysis.get('estimated_tokens', estimated_tokens)
 
+        analysis['gold_macro_context'] = gold_macro_context
         analysis = enforce_news_signal_gate(analysis, event)
         
         analysis['symbol'] = symbol
@@ -2142,24 +2204,41 @@ def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_conte
     if htf_context:
         htf_dir = htf_context.get('trend') or htf_context.get('bias')
     phase = (news_context or {}).get("analysis_phase", "PRE_RELEASE")
+    market_direction = firm if firm in {"BUY", "SELL"} else None
+    if not market_direction and picture:
+        if picture.get("score", 0) > 0:
+            market_direction = "BUY"
+        elif picture.get("score", 0) < 0:
+            market_direction = "SELL"
+    if not market_direction:
+        momentum = micro.get("momentum")
+        market_direction = "BUY" if momentum == "BULLISH" else "SELL" if momentum == "BEARISH" else None
+
+    signal = market_direction if phase == "PRE_RELEASE" else "WAIT"
     reasoning = "{} analysis for {} (fallback, AI unavailable). ".format(phase.replace("_", " ").title(), symbol)
-    reasoning += "No verified event-to-USD-to-instrument assessment was produced. "
-    reasoning += "Higher-timeframe trend: {}. It is context only and is not sufficient to infer the news impact. ".format(htf_dir or "unavailable")
-    reasoning += "Wait for a successful AI analysis and verified release data; no directional trade is recommended."
+    if signal in {"BUY", "SELL"}:
+        reasoning += f"Low-confidence {signal} lean from available gold market context; it is not a prediction of the unreleased result. "
+        reasoning += "Higher-timeframe trend: {}. Check the conditional release scenarios; the reaction can reverse this lean.".format(htf_dir or "unavailable")
+    else:
+        reasoning += "No verified event-to-USD-to-instrument assessment was produced. "
+        reasoning += "Higher-timeframe trend: {}. It is context only and is not sufficient to infer the news impact. ".format(htf_dir or "unavailable")
+        reasoning += "Wait for a successful analysis and verified release data."
     
     return {
-        "bias": "RANGING",
-        "signal": "WAIT",
+        "bias": "BULLISH" if signal == "BUY" else "BEARISH" if signal == "SELL" else "RANGING",
+        "signal": signal,
         "confluence_score": 0,
         "confidence": "LOW",
         "dxy_correlation": "NEUTRAL" if dxy_context else "UNAVAILABLE",
         "microstructure_read": "VWAP {} | RVOL {}".format(micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0)),
         "pre_news_bias": (news_context or {}).get("pre_news_bias", "News-driven reaction expected"),
         "reasoning": reasoning,
-        "rejection_reason": "AI analysis unavailable; refusing to infer a news trade from generic event history or market trend alone.",
+        "rejection_reason": "" if signal in {"BUY", "SELL"} else "AI analysis unavailable; no directional market context is available.",
         "structural_score": 0,
         "score_reason": "No verified news-impact assessment available.",
-        "candidate_direction": "WAIT",
+        "candidate_direction": signal,
+        "market_context_direction": market_direction,
+        "direction_type": "PRE_RELEASE_LEAN" if signal in {"BUY", "SELL"} else None,
         "levels_source": "PYTHON",
         "historical_pattern": historical_context or "",
         "api_status": "FALLBACK",
@@ -2276,7 +2355,7 @@ with tab2:
         st.markdown("**Analysis Process:**")
         st.markdown("- Compares released actuals with consensus and prior values when available")
         st.markdown("- Maps the event's currency impact to each instrument and quote convention")
-        st.markdown("- Cross-checks market structure, DXY, and supplied release history")
+        st.markdown("- Cross-checks gold structure, DXY, supplied release history, and FRED Treasury yields when configured")
         st.markdown("- Shows conditional scenarios before release; abstains when evidence is incomplete or conflicting")
         st.markdown("- Shares directional assessments with Telegram; these are not execution instructions")
 
@@ -2342,14 +2421,19 @@ with tab2:
                             if sig in ('BUY', 'SELL'):
                                 sig_emoji = "🟢" if sig == 'BUY' else "🔴"
                                 css_class = "buy-signal" if sig == 'BUY' else "sell-signal"
+                                pre_release_note = "<p><b>Pre-release status:</b> Low-confidence market-context lean; the release surprise is unknown.</p>" if analysis.get('direction_type') == 'PRE_RELEASE_LEAN' else ""
                                 st.markdown(f"""
                                 <div class="signal-card {css_class}">
-                                    <h3>{sig_emoji} {symbol} - {sig} | Market confluence: {analysis.get('confluence_score', 0)}/100</h3>
+                                    <h3>{sig_emoji} {symbol} - {sig}{' LEAN' if analysis.get('direction_type') == 'PRE_RELEASE_LEAN' else ''} | Market confluence: {analysis.get('confluence_score', 0)}/100</h3>
                                     <p><b>Reasoning:</b> {analysis.get('reasoning', '')}</p>
                                     <p><b>Release data:</b> {analysis.get('release_data_assessment', 'Not supplied')}</p>
+                                    <p><b>Official rates:</b> {analysis.get('gold_macro_context', 'Not supplied')}</p>
+                                    {pre_release_note}
                                     <p><b>Historical Pattern:</b> {analysis.get('historical_pattern', '')}</p>
                                 </div>
                                 """, unsafe_allow_html=True)
+                                if analysis.get('conditional_scenarios'):
+                                    st.write("Conditional scenarios:", analysis['conditional_scenarios'])
                                 
                                 st.session_state.signal_history.append({
                                     'symbol': symbol,
