@@ -42,7 +42,7 @@ def get_secret(name, default=""):
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID", "")
 SYMBOLS = ['XAUUSD', 'EURUSD', 'BTCUSD', 'US30']
-NEWS_ANALYSIS_SYMBOLS = ['XAUUSD']
+NEWS_ANALYSIS_SYMBOLS = SYMBOLS
 YFINANCE_MAP = {'XAUUSD': 'GC=F', 'EURUSD': 'EURUSD=X', 'BTCUSD': 'BTC-USD', 'US30': '^DJI', 'DXY': 'DX-Y.NYB'}
 MINIMUM_CONFLUENCE_SCORE = 72
 
@@ -1657,8 +1657,8 @@ ANALYSIS ORDER:
 - Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
 - Macro transmission: explain how this event and the supplied data may alter Fed/rate expectations, yields, and USD; distinguish a likely tendency from a certain outcome. For unreleased events, assess the most likely direction from available expectations and context, but explicitly say when the release outcome itself is unknown.
 - Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
-- Decision: for a successful AI analysis, ALWAYS select exactly one actionable direction: BUY or SELL. Do not return WAIT, HOLD, neutral, or no-trade. Missing actual data is not by itself a reason to abstain: make the best-supported directional call using the event's typical macro transmission and the live market evidence. If the event-specific direction is unknowable or evidence conflicts, use the strongest current instrument-specific structure and DXY evidence as the tie-breaker, lower confidence, and state the uncertainty plainly. Do not claim an unreleased outcome is known. Do not provide entry, stop-loss, or take-profit prices.
-- Reasoning: provide at least 150 words that directly justify the selected BUY/SELL signal. Cover the event data and whether the actual is pending, the likely USD channel, the mapping into this instrument, the strongest confirming and opposing live evidence, and why the chosen direction wins despite uncertainty. Never describe a WAIT decision when the signal is BUY or SELL.
+- Decision: never force a direction. For PRE_RELEASE, the outcome and surprise are unknown: return WAIT and explain conditional above/below-consensus scenarios without choosing a trade direction. For POST_RELEASE, return BUY or SELL only when the supplied actual and forecast are both present and comparable, the surprise direction is clear for this indicator, the likely USD impact and this instrument's effect are unambiguous, confidence is MEDIUM or HIGH, and directional evidence supports the chosen side. Otherwise return WAIT and identify the missing or conflicting evidence. Technical structure may contextualize a news reaction but must not be used to manufacture a news-driven direction. Do not provide entry, stop-loss, or take-profit prices.
+- Reasoning: for BUY or SELL, cite the supplied release values, likely USD channel, instrument mapping, confirming evidence, and strongest caveat. For WAIT, state why the evidence gate failed and describe conditional scenarios without implying a chosen direction. Never invent sources or values.
 
 DATA PROVIDED:
 {data_summary}
@@ -1689,7 +1689,7 @@ Return strict JSON only, no markdown. Keep reasoning concise but explicit; cite 
 {{
 "market_state": "continuation|reversal|exhaustion|trend|coiling|unclear",
 "bias": "BULLISH|BEARISH|RANGING",
-"signal": "BUY|SELL",
+"signal": "BUY|SELL|WAIT",
 "confluence_score": 0,
 "confidence": "HIGH|MEDIUM|LOW",
 "usd_impact": "STRONGER|WEAKER|MIXED|UNKNOWN",
@@ -1702,8 +1702,9 @@ Return strict JSON only, no markdown. Keep reasoning concise but explicit; cite 
 "historical_pattern": "Only supplied release history and observed comparisons; explicitly state when unavailable",
 "current_positioning": "Supplied current market positioning relative to the conditional/observed move",
 "news_impact_mechanics": "Event-to-rates-to-USD-to-this-instrument transmission and caveats",
+"conditional_scenarios": "For PRE_RELEASE, describe possible above/below-consensus transmission; otherwise state not applicable",
 "reasoning": "Evidence-based synthesis",
-"rejection_reason": "Empty; the directional signal must be BUY or SELL"
+"rejection_reason": "Why WAIT was selected, or empty when a supported post-release direction is selected"
 }}"""
 
 # ── Groq API Integration (Robust Pattern) ────────────────────────────────
@@ -1916,6 +1917,51 @@ def normalize_analysis_signals(analysis):
         analysis['candidate_direction'] = normalize_ai_signal(analysis['candidate_direction'])
     return analysis
 
+def are_comparable_news_values(actual, forecast):
+    value_pattern = r'\s*([+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+))\s*([%KMB]?)\s*'
+    actual_match = re.fullmatch(value_pattern, str(actual), flags=re.IGNORECASE)
+    forecast_match = re.fullmatch(value_pattern, str(forecast), flags=re.IGNORECASE)
+    return bool(actual_match and forecast_match and actual_match.group(2).upper() == forecast_match.group(2).upper())
+
+def enforce_news_signal_gate(analysis, event):
+    if not isinstance(analysis, dict):
+        return analysis
+
+    signal = normalize_ai_signal(analysis.get('signal'))
+    phase = event.get('analysis_phase', 'PRE_RELEASE')
+    reason = None
+    if phase != 'POST_RELEASE':
+        reason = 'Pre-release outcome is unknown; review conditional scenarios and wait for actual data.'
+    elif not has_reported_value(event.get('actual')) or not has_reported_value(event.get('forecast')):
+        reason = 'Actual and consensus forecast are both required to assess the release surprise.'
+    elif not are_comparable_news_values(event.get('actual'), event.get('forecast')):
+        reason = 'Actual and forecast must be numeric values with matching units before assessing the release surprise.'
+    elif signal not in {'BUY', 'SELL'}:
+        reason = analysis.get('rejection_reason') or 'The analysis did not establish a supported direction.'
+    elif str(analysis.get('confidence', '')).upper() not in {'MEDIUM', 'HIGH'}:
+        reason = 'Directional confidence is too low to present a BUY or SELL assessment.'
+    elif str(analysis.get('usd_impact', '')).upper() not in {'STRONGER', 'WEAKER'}:
+        reason = 'The event-to-USD impact is mixed or not established.'
+    elif str(analysis.get('instrument_effect', '')).upper() not in {'UP', 'DOWN'}:
+        reason = 'The effect on this instrument is mixed or not established.'
+    else:
+        evidence = analysis.get('directional_evidence')
+        side = 'bullish' if signal == 'BUY' else 'bearish'
+        side_evidence = evidence.get(side) if isinstance(evidence, dict) else None
+        if not isinstance(side_evidence, list) or not any(str(item).strip() for item in side_evidence):
+            reason = f'No explicit {side} evidence was supplied to support the model direction.'
+
+    if reason:
+        if signal in {'BUY', 'SELL'}:
+            analysis['model_candidate_direction'] = signal
+        analysis['signal'] = 'WAIT'
+        analysis['candidate_direction'] = 'WAIT'
+        analysis['decision_gate_reason'] = reason
+        analysis['rejection_reason'] = reason
+    else:
+        analysis['decision_gate_reason'] = 'Released actual, forecast, impact mapping, confidence, and directional evidence passed the minimum output checks.'
+    return analysis
+
 def sanitize_news_event_analysis(analysis):
     if not isinstance(analysis, dict):
         return analysis
@@ -2076,6 +2122,8 @@ def analyze_news_for_symbol(symbol, all_data, event):
             if groq_raw_output:
                 analysis['groq_raw_output'] = groq_raw_output
             analysis['estimated_tokens'] = analysis.get('estimated_tokens', estimated_tokens)
+
+        analysis = enforce_news_signal_gate(analysis, event)
         
         analysis['symbol'] = symbol
         analysis['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2224,13 +2272,13 @@ with tab2:
     if not st.session_state.fetched_news:
         st.warning("⚠️ No news fetched yet. Please go to the 'Fetch News' tab and fetch the calendar first.")
     else:
-        st.info(f"Ready to analyse {len(st.session_state.fetched_news)} events for XAUUSD using Groq AI.")
+        st.info(f"Ready to analyse {len(st.session_state.fetched_news)} events across {', '.join(NEWS_ANALYSIS_SYMBOLS)} using Groq AI.")
         st.markdown("**Analysis Process:**")
-        st.markdown("- Fetches market context for XAUUSD only")
-        st.markdown("- Applies 5-layer systematic analysis framework")
-        st.markdown("- Integrates FRED historical data + curated news knowledge")
-        st.markdown("- Outputs direction-only signals (no Entry/SL/TP)")
-        st.markdown("- Sends verified signals to Telegram")
+        st.markdown("- Compares released actuals with consensus and prior values when available")
+        st.markdown("- Maps the event's currency impact to each instrument and quote convention")
+        st.markdown("- Cross-checks market structure, DXY, and supplied release history")
+        st.markdown("- Shows conditional scenarios before release; abstains when evidence is incomplete or conflicting")
+        st.markdown("- Shares directional assessments with Telegram; these are not execution instructions")
 
         selected_event = None
         for event_index, event in enumerate(st.session_state.fetched_news):
@@ -2296,8 +2344,9 @@ with tab2:
                                 css_class = "buy-signal" if sig == 'BUY' else "sell-signal"
                                 st.markdown(f"""
                                 <div class="signal-card {css_class}">
-                                    <h3>{sig_emoji} {symbol} - {sig} | Score: {analysis.get('confluence_score', 0)}/100</h3>
+                                    <h3>{sig_emoji} {symbol} - {sig} | Market confluence: {analysis.get('confluence_score', 0)}/100</h3>
                                     <p><b>Reasoning:</b> {analysis.get('reasoning', '')}</p>
+                                    <p><b>Release data:</b> {analysis.get('release_data_assessment', 'Not supplied')}</p>
                                     <p><b>Historical Pattern:</b> {analysis.get('historical_pattern', '')}</p>
                                 </div>
                                 """, unsafe_allow_html=True)
@@ -2320,7 +2369,10 @@ with tab2:
                                 add_notification('success', f"✅ {symbol}: {sig} signal for {event['event']}. Score: {analysis.get('confluence_score', 0)}/100. Model: {model_used}. Tokens: {total_tokens}. Reasoning: {analysis.get('reasoning', 'Not provided.')}", symbol=symbol, signal=sig, score=analysis.get('confluence_score', 0))
                             elif sig == 'WAIT':
                                 reasoning = analysis.get('reasoning', analysis.get('rejection_reason', 'No edge found.'))
-                                st.info(f"⚪ {symbol}: WAIT - {reasoning}")
+                                gate_reason = analysis.get('decision_gate_reason') or analysis.get('rejection_reason')
+                                st.info(f"⚪ {symbol}: WAIT - {gate_reason or reasoning}")
+                                if analysis.get('conditional_scenarios'):
+                                    st.write("Conditional scenarios:", analysis['conditional_scenarios'])
                                 add_notification('info', f"⚪ {symbol}: WAIT for {event['event']}. Model: {model_used}. Tokens: {total_tokens}. Reasoning: {reasoning}", symbol=symbol, signal='WAIT')
                             else:
                                 st.warning(f"⚪ {symbol}: SKIPPED - {analysis.get('reason', 'rate limit')}")
