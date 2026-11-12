@@ -8,11 +8,320 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-from news_evidence import build_news_evidence_council
 try:
     import yfinance as yf
 except Exception:
     yf = None
+
+# ── Self-contained economic-event evidence ────────────────────────────────
+NEWS_EVENT_NUMBER_PATTERN = re.compile(
+    r"^\s*([+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+))\s*([%KMBT]?)\s*$",
+    re.IGNORECASE,
+)
+
+def classify_usd_event(event):
+    name = str(event.get("event") or "").upper()
+    patterns = [
+        (r"NON[- ]?FARM|PAYROLL|NFP|AVERAGE HOURLY EARNINGS|WAGE GROWTH", "Employment", 1),
+        (r"UNEMPLOYMENT RATE|UNEMPLOYMENT", "Unemployment", -1),
+        (r"JOBLESS CLAIMS|INITIAL CLAIMS|CONTINUING CLAIMS", "Jobless claims", -1),
+        (r"\bCPI\b|CONSUMER PRICE INDEX|\bINFLATION\b|\bPCE\b|PERSONAL CONSUMPTION EXPENDITURES|\bPPI\b|PRODUCER PRICE", "Inflation", 1),
+        (r"\bGDP\b|GROSS DOMESTIC PRODUCT", "GDP", 1),
+        (r"RETAIL SALES", "Retail sales", 1),
+        (r"\bISM\b|\bPMI\b|PURCHASING MANAGERS", "Business activity", 1),
+        (r"CONSUMER CONFIDENCE|CONSUMER SENTIMENT|MICHIGAN", "Consumer confidence", 1),
+        (r"INDUSTRIAL PRODUCTION", "Industrial production", 1),
+        (r"DURABLE GOODS", "Durable goods", 1),
+        (r"HOUSING STARTS|BUILDING PERMITS|EXISTING HOME SALES|NEW HOME SALES", "Housing", 1),
+        (r"FOMC|FEDERAL RESERVE|FEDERAL OPEN MARKET|MONETARY POLICY", "Central-bank communication", 0),
+        (r"FEDERAL FUNDS RATE|INTEREST RATE|RATE DECISION", "Policy rate", 1),
+    ]
+    for pattern, category, higher_supports_usd in patterns:
+        if re.search(pattern, name):
+            mapping = (
+                "HIGHER_SUPPORTS_USD" if higher_supports_usd > 0 else
+                "LOWER_SUPPORTS_USD" if higher_supports_usd < 0 else "UNMAPPED"
+            )
+            return {"category": category, "mapping": mapping}
+    return {"category": "Other / qualitative", "mapping": "UNMAPPED"}
+
+def _event_numeric_value(value, default_unit=""):
+    if value is None:
+        return None
+    match = NEWS_EVENT_NUMBER_PATTERN.fullmatch(str(value))
+    if not match:
+        return None
+    return float(match.group(1).replace(",", "")), (match.group(2) or default_unit).upper()
+
+def _event_release_assessment(event):
+    unit = (event.get("unit") or "").strip()
+    actual = _event_numeric_value(event.get("actual"), unit)
+    forecast = _event_numeric_value(event.get("forecast"), unit)
+    previous = _event_numeric_value(event.get("previous"), unit)
+    result = {
+        "status": "pending" if actual is None else "published",
+        "comparison": "Actual or consensus forecast is unavailable or not numeric.",
+        "actual": event.get("actual"),
+        "forecast": event.get("forecast"),
+        "previous": event.get("previous"),
+        "unit": unit or None,
+        "surprise_direction": "UNKNOWN",
+        "surprise_difference": None,
+    }
+    if actual and forecast and actual[1] == forecast[1]:
+        difference = actual[0] - forecast[0]
+        direction, wording = (
+            ("ABOVE", "above") if difference > 0 else
+            ("BELOW", "below") if difference < 0 else
+            ("IN_LINE", "in line with")
+        )
+        result["surprise_direction"] = direction
+        result["surprise_difference"] = difference
+        result["comparison"] = (
+            f"Actual was {wording} the supplied consensus by "
+            f"{difference:+g}{actual[1] or unit}."
+        )
+    elif actual and forecast:
+        result["comparison"] = (
+            "Actual and forecast have incompatible units; no surprise comparison was made."
+        )
+    if actual and previous and actual[1] == previous[1]:
+        result["change_vs_previous"] = (
+            f"Actual changed by {actual[0] - previous[0]:+g}"
+            f"{actual[1] or unit} versus the supplied previous value."
+        )
+    else:
+        result["change_vs_previous"] = "Comparable previous value unavailable."
+    return result
+
+def _event_rate_summary(observations):
+    lines = []
+    for label, series_id in (
+        ("2-year nominal Treasury yield", "DGS2"),
+        ("10-year nominal Treasury yield", "DGS10"),
+        ("10-year real Treasury yield", "DFII10"),
+    ):
+        series = observations.get(series_id) or []
+        if not series:
+            lines.append(f"{label}: unavailable.")
+            continue
+        latest = series[0]
+        line = f"{label}: {latest['value']:.3f}% on {latest['date']}"
+        if len(series) >= 5:
+            change = latest["value"] - series[4]["value"]
+            line += f"; five-observation change {change:+.3f} percentage points"
+        elif len(series) >= 2:
+            change = latest["value"] - series[-1]["value"]
+            line += f"; change over {len(series)} observations {change:+.3f} percentage points"
+        lines.append(line + ".")
+    return lines
+
+def _event_technical_read(picture):
+    if not picture:
+        return {"signal": "UNAVAILABLE", "reasoning": "Multi-timeframe price structure was unavailable."}
+    score = float(picture.get("score") or 0)
+    htf_bias = str(picture.get("htf_bias") or "NEUTRAL").upper()
+    direction = "BUY" if score >= 2 else "SELL" if score <= -2 else "NEUTRAL"
+    if direction == "BUY" and htf_bias == "BEARISH" and abs(score) < 6:
+        direction = "NEUTRAL"
+    elif direction == "SELL" and htf_bias == "BULLISH" and abs(score) < 6:
+        direction = "NEUTRAL"
+    evidence = (
+        picture.get("bull_items", []) if direction == "BUY" else
+        picture.get("bear_items", []) if direction == "SELL" else []
+    )
+    reason = f"Weighted multi-timeframe structure score {score:+.1f}; H1/H4 context {htf_bias.lower()}."
+    if evidence:
+        reason += " Evidence: " + "; ".join(evidence[:4]) + "."
+    elif direction == "NEUTRAL":
+        reason += " Evidence is weak or conflicting; no technical vote."
+    return {"signal": direction, "reasoning": reason}
+
+def _event_liquidity_read(df):
+    unavailable = {
+        "signal": "NEUTRAL",
+        "reasoning": "Previous-session high/low unavailable; no directional liquidity inference.",
+    }
+    if df is None or df.empty or not {"High", "Low", "Close"}.issubset(df.columns):
+        return unavailable
+    try:
+        frame = df.copy()
+        frame.index = pd.to_datetime(frame.index, utc=True)
+        frame = frame.sort_index()
+        dates = pd.Index(frame.index.date).unique()
+        if len(dates) < 2:
+            return unavailable
+        prior = frame.loc[frame.index.date == dates[-2]]
+        if prior.empty:
+            return unavailable
+        price = float(frame["Close"].iloc[-1])
+        high = float(pd.to_numeric(prior["High"], errors="coerce").max())
+        low = float(pd.to_numeric(prior["Low"], errors="coerce").min())
+        if not np.isfinite(price + high + low):
+            return unavailable
+        high_distance, low_distance = abs(high - price), abs(price - low)
+        nearer = "previous UTC calendar-day high" if high_distance < low_distance else "previous UTC calendar-day low"
+        return {
+            "signal": "NEUTRAL",
+            "reasoning": (
+                f"Price {price:.2f}; previous UTC calendar-day high {high:.2f} "
+                f"({high_distance:.2f} away), low {low:.2f} ({low_distance:.2f} away). "
+                f"{nearer} is nearer, but proximity alone does not predict a sweep or breakout direction."
+            ),
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
+        return unavailable
+
+def _event_volatility_read(df):
+    unavailable = {
+        "regime": "UNAVAILABLE",
+        "reasoning": "Not enough recent bars to compare current ATR with its local baseline.",
+    }
+    if df is None or df.empty or len(df) < 35:
+        return unavailable
+    try:
+        high = pd.to_numeric(df["High"], errors="coerce")
+        low = pd.to_numeric(df["Low"], errors="coerce")
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        true_range = pd.concat(
+            [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+            axis=1,
+        ).max(axis=1)
+        atr = true_range.rolling(14, min_periods=14).mean().dropna()
+        if len(atr) < 20:
+            return unavailable
+        current = float(atr.iloc[-1])
+        baseline = float(atr.iloc[-21:-1].median())
+        if not np.isfinite(current) or not np.isfinite(baseline) or baseline <= 0:
+            return unavailable
+        ratio = current / baseline
+        regime = "EXPANDED" if ratio >= 1.25 else "COMPRESSED" if ratio <= 0.8 else "NEAR_RECENT_NORM"
+        return {
+            "regime": regime,
+            "reasoning": (
+                f"Latest 14-bar ATR is {ratio:.2f}x the median of the prior 20 ATR "
+                "readings. This local heuristic measures risk, not direction."
+            ),
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
+        return unavailable
+
+def build_news_evidence_council(event, picture, m10, rate_observations=None):
+    event_type = classify_usd_event(event)
+    phase = event.get("analysis_phase", "PRE_RELEASE")
+    release = _event_release_assessment(event)
+    technical = _event_technical_read(picture)
+    liquidity = _event_liquidity_read(m10)
+    volatility = _event_volatility_read(m10)
+    higher_supports_usd = event_type["mapping"] == "HIGHER_SUPPORTS_USD"
+    lower_supports_usd = event_type["mapping"] == "LOWER_SUPPORTS_USD"
+    macro_signal = "NEUTRAL"
+    macro_reason = (
+        f"{event_type['category']} actual is pending. Compare the eventual actual with "
+        "the supplied consensus, not with the previous value, to identify a surprise. "
+    )
+    if higher_supports_usd or lower_supports_usd:
+        macro_reason += (
+            "For this indicator, a "
+            + ("higher" if higher_supports_usd else "lower")
+            + " reading can support USD; the reverse can weigh on USD. This is a "
+            "conditional historical tendency, not a forecast of the result or a guaranteed gold reaction."
+        )
+    else:
+        macro_reason += (
+            "No generic numeric surprise-to-USD mapping is applied to this event. "
+            "Qualitative statement content and market repricing require separate review."
+        )
+    if phase == "POST_RELEASE":
+        direction = release["surprise_direction"]
+        if direction in {"ABOVE", "BELOW"} and (higher_supports_usd or lower_supports_usd):
+            usd_strengthened = (direction == "ABOVE") == higher_supports_usd
+            macro_signal = "SELL" if usd_strengthened else "BUY"
+            usd_effect = "supportive" if usd_strengthened else "negative"
+            macro_reason = (
+                f"{release['comparison']} Based on the supplied event classification, "
+                f"this surprise is conditionally {usd_effect} for USD and therefore maps "
+                f"to {macro_signal} pressure on XAUUSD, all else equal. This is a macro "
+                "tendency, not a trade signal; validate revisions/components, Treasury repricing, "
+                "and gold's observed response."
+            )
+        elif direction == "IN_LINE":
+            macro_reason = (
+                f"{release['comparison']} An in-line headline alone supplies no directional "
+                "surprise; details, revisions, expectations already priced in, and market repricing can dominate."
+            )
+        else:
+            macro_reason = (
+                f"{release['comparison']} No generic event-to-USD direction is inferred from these supplied values."
+            )
+    analysts = [
+        {"analyst": f"Macro / {event_type['category']}", "signal": macro_signal, "reasoning": macro_reason},
+        {"analyst": "Technical", "signal": technical["signal"], "reasoning": technical["reasoning"]},
+        {"analyst": "Liquidity", "signal": liquidity["signal"], "reasoning": liquidity["reasoning"]},
+        {
+            "analyst": "Sentiment / positioning",
+            "signal": "UNAVAILABLE",
+            "reasoning": (
+                "No current, timestamped COT positioning or gold ETF-flow feed is connected. "
+                "Price movement is not treated as a substitute for sentiment."
+            ),
+        },
+        {
+            "analyst": "Risk",
+            "signal": "RISK ONLY",
+            "reasoning": (
+                f"{volatility['regime']}: {volatility['reasoning']} Higher volatility widens "
+                "outcome uncertainty; it does not imply a sell direction."
+            ),
+        },
+    ]
+    directional = [a["signal"] for a in analysts if a["signal"] in {"BUY", "SELL"}]
+    neutral = sum(a["signal"] == "NEUTRAL" for a in analysts)
+    if higher_supports_usd or lower_supports_usd:
+        if higher_supports_usd:
+            above, below = "USD-supportive and gold-negative", "USD-negative and gold-supportive"
+        else:
+            above, below = "USD-negative and gold-supportive", "USD-supportive and gold-negative"
+        scenarios = [
+            f"Above consensus: potentially {above}, subject to revisions, component detail, expectations already priced, Treasury repricing, and the observed gold response.",
+            "In line: no clear headline surprise; revisions, subcomponents, positioning, and pre-release pricing can dominate.",
+            f"Below consensus: potentially {below}, subject to revisions, component detail, expectations already priced, Treasury repricing, and the observed gold response.",
+        ]
+    else:
+        scenarios = [
+            "Do not infer a directional surprise from numeric higher/lower values for this event classification.",
+            "For policy communication, assess statement details against expectations and confirm with Treasury repricing and the market response.",
+            "If actual, forecast, or event meaning is unclear, mark the macro view unknown rather than inventing a scenario.",
+        ]
+    rates_context = _event_rate_summary(rate_observations or {})
+    return {
+        "event_type": event_type,
+        "release": release,
+        "analysts": analysts,
+        "tally": {
+            "BUY": directional.count("BUY"),
+            "SELL": directional.count("SELL"),
+            "NEUTRAL": neutral,
+            "NONVOTING": len(analysts) - len(directional) - neutral,
+        },
+        "volatility_regime": volatility["regime"],
+        "rates_context": rates_context,
+        "scenarios": scenarios,
+        "probability_note": (
+            "Scenario probabilities are not shown: no forecast-error dataset or "
+            "out-of-sample calibrated probability model is connected."
+        ),
+        "scope_note": (
+            "This assessment uses the selected calendar row; the calendar feed is not treated "
+            "as the official release source. Indicator components, revisions, and qualitative "
+            "details are not cross-checked unless supplied. Gold prices may use a GC=F futures proxy "
+            "if the spot feed is unavailable."
+        ),
+        "quality_note": (
+            "Signals are evidence summaries, not independent experts or validated probabilities. "
+            "Liquidity is nondirectional, risk is not a vote, and sentiment is unavailable without a live, dated source."
+        ),
+    }
 
 # ── Page Config & UI Styling ───────────────────────────────────────────────
 st.set_page_config(page_title="Der-AI | News Analysis", page_icon="📰", layout="wide", initial_sidebar_state="expanded")
