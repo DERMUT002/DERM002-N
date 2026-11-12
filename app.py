@@ -2445,7 +2445,37 @@ def enforce_news_signal_gate(analysis, event):
         market_direction = normalize_ai_signal(analysis.get('market_context_direction'))
         evidence = analysis.get('pre_release_evidence') or {}
         if signal not in {'BUY', 'SELL'}:
-            reason = 'The model abstained; no pre-release direction is published.'
+            if (
+                signal == 'WAIT'
+                and market_direction in {'BUY', 'SELL'}
+                and evidence.get('score', 0) >= 50
+                and evidence.get('timeframes', 0) >= 3
+                and evidence.get('higher_timeframes_aligned')
+            ):
+                analysis['signal'] = market_direction
+                analysis['bias'] = 'BULLISH' if market_direction == 'BUY' else 'BEARISH'
+                analysis['direction_type'] = 'PRE_RELEASE_LEAN'
+                analysis['candidate_direction'] = market_direction
+                analysis['confidence'] = 'LOW'
+                analysis['confluence_score'] = evidence['score']
+                analysis['decision_gate_reason'] = (
+                    f"The model abstained; a low-confidence {market_direction} "
+                    f"market-context lean is published because {evidence['reason']} "
+                    "This reflects gold-market structure only, not a prediction of "
+                    "the unreleased event; the score is not a win probability."
+                )
+                analysis['reasoning'] = (
+                    f"{analysis.get('reasoning', '').strip()} "
+                    "The model abstained; this low-confidence direction is derived "
+                    "from aligned gold-market technical evidence, not the pending "
+                    "release outcome."
+                ).strip()
+                analysis['rejection_reason'] = ''
+                return analysis
+            reason = (
+                'The model abstained and there is not enough aligned market evidence '
+                'to publish a pre-release direction.'
+            )
         elif market_direction not in {'BUY', 'SELL'}:
             reason = 'No firm Python market-context direction is available.'
         elif signal != market_direction:
