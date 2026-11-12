@@ -8,6 +8,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
+from news_evidence import build_news_evidence_council
 try:
     import yfinance as yf
 except Exception:
@@ -161,6 +162,15 @@ def build_news_event_telegram(event, results, now):
                 lines.append(f"📚 Historical: {_escape_telegram_html(hist_pattern)}")
             if reason_escaped:
                 lines.append(f"🧠 {reason_escaped}")
+            council = a.get('news_evidence_council')
+            if council:
+                tally = council.get('tally', {})
+                lines.append(
+                    "🧭 Event evidence (not calibrated odds): "
+                    f"{tally.get('BUY', 0)} BUY / {tally.get('SELL', 0)} SELL; "
+                    f"volatility {_escape_telegram_html(council.get('volatility_regime', 'unavailable'))}; "
+                    "COT/ETF sentiment unavailable unless sourced."
+                )
             if event.get('analysis_phase') != 'POST_RELEASE' and a.get('conditional_scenarios'):
                 lines.append(f"🔀 Conditional scenarios: {_escape_telegram_html(a['conditional_scenarios'])}")
             lines.append("")
@@ -1525,7 +1535,8 @@ def fetch_fred_historical_context(event, ttl_seconds=3600):
         cached = st.session_state.get(cache_key)
         if cached and (now - cached.get("fetched_at", now)).total_seconds() < ttl_seconds:
             return cached.get("text")
-        observations = fetch_fred_observations(series_id, limit=6)
+        observation_limit = 14 if series_id in {"CPIAUCSL", "CPILFESL"} else 6
+        observations = fetch_fred_observations(series_id, limit=observation_limit)
         if not observations:
             return None
         parts = ["{} = {:g}".format(o["date"], o["value"]) for o in observations]
@@ -1554,6 +1565,14 @@ def fetch_fred_historical_context(event, ttl_seconds=3600):
             if percent_change is not None:
                 comparison += " ({:+.2f}%)".format(percent_change)
             comparison += " from {} to {}".format(previous["date"], current["date"])
+        if series_id in {"CPIAUCSL", "CPILFESL"} and len(observations) > 12:
+            year_ago = observations[12]
+            if year_ago["value"]:
+                year_change = (current["value"] / year_ago["value"] - 1) * 100
+                comparison += (
+                    "; latest reported 12-month index change: {:+.2f}% "
+                    "from {} to {} (historical period, not necessarily this event's release)"
+                ).format(year_change, year_ago["date"], current["date"])
         text = (
             "FRED source: {}; series {}; latest reported observation for period {} = {:g}; {}; "
             "recent periods, newest first: {}. These are reported indicator periods, not necessarily this calendar month's release."
@@ -1581,34 +1600,45 @@ def fetch_news_historical_context(event):
     return None
 
 def build_gold_macro_context(ttl_seconds=3600):
-    if not get_secret("FRED_API_KEY", "").strip():
-        return "FRED Treasury-yield context unavailable; configure FRED_API_KEY to include official 2-year and 10-year real-yield observations."
-
     cache_key = "_gold_macro_context_cache"
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     cached = st.session_state.get(cache_key)
     if cached and (now - cached.get("fetched_at", now)).total_seconds() < ttl_seconds:
+        st.session_state["_gold_macro_observations_cache"] = cached.get("observations", {})
         return cached.get("text", "")
 
-    series = {"2-year Treasury yield": "DGS2", "10-year real Treasury yield": "DFII10"}
+    series = {
+        "2-year nominal Treasury yield": "DGS2",
+        "10-year nominal Treasury yield": "DGS10",
+        "10-year real Treasury yield": "DFII10",
+    }
     with ThreadPoolExecutor(max_workers=len(series)) as executor:
-        futures = {label: executor.submit(fetch_fred_observations, series_id, 2) for label, series_id in series.items()}
+        futures = {
+            label: executor.submit(fetch_fred_observations, series_id, 5)
+            for label, series_id in series.items()
+        }
 
     lines = []
+    observations_by_series = {}
     for label, future in futures.items():
         try:
             observations = future.result()
         except Exception:
             observations = None
+        observations_by_series[series[label]] = observations or []
         if not observations:
             lines.append(f"{label}: unavailable")
             continue
         latest = observations[0]
         line = f"FRED {series[label]} {label}: {latest['value']:.3f}% for {latest['date']}"
-        if len(observations) > 1:
-            previous = observations[1]
+        if len(observations) >= 5:
+            previous = observations[4]
             change = latest['value'] - previous['value']
-            line += f"; prior {previous['value']:.3f}% on {previous['date']}; change {change:+.3f} percentage points"
+            line += f"; five-observation change {change:+.3f} percentage points from {previous['date']}"
+        elif len(observations) > 1:
+            previous = observations[-1]
+            change = latest['value'] - previous['value']
+            line += f"; change {change:+.3f} percentage points from {previous['date']}"
         try:
             age_days = (datetime.now(timezone.utc).date() - datetime.strptime(latest['date'], "%Y-%m-%d").date()).days
             if age_days > 5:
@@ -1617,8 +1647,16 @@ def build_gold_macro_context(ttl_seconds=3600):
             line += "; observation age unavailable"
         lines.append(line)
 
-    context = "Official rate context (daily data; not intraday): " + "; ".join(lines)
-    st.session_state[cache_key] = {"text": context, "fetched_at": now}
+    context = (
+        "FRED official Treasury observations (daily, not intraday; public CSV fallback "
+        "does not require an API key): " + "; ".join(lines)
+    )
+    st.session_state["_gold_macro_observations_cache"] = observations_by_series
+    st.session_state[cache_key] = {
+        "text": context,
+        "observations": observations_by_series,
+        "fetched_at": now,
+    }
     return context
 
 # ── News Fetching ────────────────────────────────────────────────────────
@@ -1703,6 +1741,8 @@ ANALYSIS ORDER:
 - Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
 - Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Before release, the actual surprise is unknown, but when market data exists select BUY or SELL as a low-confidence directional lean based on the supplied gold trend, DXY, rates, forecast-versus-previous context, and event transmission. Do not describe that lean as a prediction of the actual result; explain that the scenarios can reverse it. Use WAIT only if no directional market evidence is available. After release, return BUY or SELL only when actual and forecast are present and comparable, the surprise direction is clear for this indicator, the likely USD impact and gold effect are supported, and directional evidence confirms the side. Otherwise return WAIT and identify the missing or conflicting evidence. Do not provide entry, stop-loss, or take-profit prices.
 - Reasoning: for a PRE_RELEASE lean, identify it as a market-context bias, cite available data and uncertainty, and include conditional scenarios. For POST_RELEASE, cite actual, forecast, surprise, likely USD/rates channel, gold reaction evidence, and the strongest caveat. For WAIT, state why evidence is insufficient. Never invent sources or values.
+- Never invent a percentage probability or treat a confidence label/confluence score as a calibrated probability. Do not assign odds to any event outcome unless a supplied, validated forecast-error model provides those odds. Higher realized volatility increases uncertainty and is not directional evidence.
+- For any USD event, use the supplied event evidence council. Apply an event-specific numeric surprise mapping only when explicitly supported; otherwise leave macro direction unknown. Liquidity proximity is not a forecast of a sweep; risk is not a directional vote; sentiment is unavailable unless a dated positioning/flow source is supplied. Do not claim COT or ETF flows when absent.
 
 DATA PROVIDED:
 {data_summary}
@@ -1724,6 +1764,8 @@ RELEASE AND HISTORICAL DATA:
 {historical_context}
 OFFICIAL TREASURY-YIELD CONTEXT (check observation dates and staleness):
 {gold_macro_context}
+EVENT EVIDENCE COUNCIL (applies across USD events; treat unavailable inputs as unknown):
+{news_evidence_context}
 NEWS EVENT DETAILS:
 {news_summary}
 STRUCTURAL SCORE (PYTHON):
@@ -2112,6 +2154,12 @@ def analyze_news_for_symbol(symbol, all_data, event):
         if not historical_context:
             historical_context = build_historical_context(m10)
         gold_macro_context = build_gold_macro_context()
+        news_evidence = build_news_evidence_council(
+            event,
+            picture,
+            m10,
+            st.session_state.get('_gold_macro_observations_cache', {}),
+        )
         
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
         
@@ -2135,6 +2183,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
             'dxy_data': dxy_summary,
             'historical_context': historical_context,
             'gold_macro_context': gold_macro_context,
+            'news_evidence_context': json.dumps(news_evidence, ensure_ascii=True),
             'news_summary': news_summary,
             'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger,
@@ -2185,6 +2234,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
             analysis['estimated_tokens'] = analysis.get('estimated_tokens', estimated_tokens)
 
         analysis['gold_macro_context'] = gold_macro_context
+        analysis['news_evidence_council'] = news_evidence
         analysis = enforce_news_signal_gate(analysis, event)
         
         analysis['symbol'] = symbol
@@ -2416,6 +2466,49 @@ with tab2:
                                 with st.expander("🐛 Debug AI Response (Why it failed)"):
                                     st.code(analysis.get('raw_output', 'No raw output captured.'), language='json')
                                     st.error(f"Rejection Reason: {analysis.get('rejection_reason', 'Unknown')}")
+
+                            news_evidence = analysis.get('news_evidence_council')
+                            if news_evidence:
+                                st.subheader("Event evidence council")
+                                st.caption(
+                                    "Directional evidence is separated from risk and nondirectional liquidity. "
+                                    "This is not a set of independent analysts or calibrated probabilities."
+                                )
+                                st.write(
+                                    "**Event classification:**",
+                                    news_evidence["event_type"]["category"],
+                                    "| **Release comparison:**",
+                                    news_evidence["release"]["comparison"],
+                                )
+                                st.write(
+                                    "**Release status:**",
+                                    news_evidence["release"]["status"],
+                                    "| **Surprise classification:**",
+                                    news_evidence["release"]["surprise_direction"],
+                                )
+                                st.caption(news_evidence["scope_note"])
+                                st.dataframe(
+                                    pd.DataFrame(news_evidence["analysts"]),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                                st.write("**Scenario map (conditional, not probability-weighted):**")
+                                for scenario in news_evidence["scenarios"]:
+                                    st.write(f"- {scenario}")
+                                st.info(news_evidence["probability_note"])
+                                st.caption(news_evidence["quality_note"])
+                                st.markdown(
+                                    "[BLS CPI](https://www.bls.gov/cpi/) · "
+                                    "[FRED 2-year yield](https://fred.stlouisfed.org/series/DGS2) · "
+                                    "[FRED 10-year yield](https://fred.stlouisfed.org/series/DGS10) · "
+                                    "[FRED 10-year real yield](https://fred.stlouisfed.org/series/DFII10) · "
+                                    "[CFTC COT reports](https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm) · "
+                                    "[World Gold Council research](https://www.gold.org/goldhub/research/gold-demand-trends)"
+                                )
+                                if news_evidence["rates_context"]:
+                                    st.write("**Recent official rate context:**")
+                                    for rate_line in news_evidence["rates_context"]:
+                                        st.write(f"- {rate_line}")
                             
                             sig = analysis.get('signal', 'SKIPPED')
                             if sig in ('BUY', 'SELL'):
@@ -2534,9 +2627,10 @@ with tab4:
 with tab5:
     st.header("⚙️ System Settings")
     st.info("Ensure `GROQ_API_KEY`, `FRED_API_KEY` (optional), `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are set in your Streamlit Secrets.")
-    st.markdown("- **AI Model:** Llama 3.3 70B Versatile (via Groq)")
+    st.markdown("- **AI Model:** Configured Groq model with Python rule-based fallback")
     st.markdown("- **Execution:** Manual trigger only (No auto-loop)")
-    st.markdown("- **Features:** 5-Layer News Analysis, FRED API integration, Curated News Knowledge, Multi-Timeframe Context, DXY Correlation")
+    st.markdown("- **Features:** Cross-event evidence council, public FRED yield-data fallback, release comparisons, multi-timeframe context, and DXY cross-checks")
+    st.markdown("- **Probabilities:** No event-scenario percentages without an empirically validated calibration set; COT/ETF sentiment is unavailable unless sourced")
     st.markdown(f"- **Minimum Confluence Score:** {MINIMUM_CONFLUENCE_SCORE}/100")
     st.markdown("- **News Signals:** Direction-only (no Entry/SL/TP)")
     st.markdown("- **Telegram Bridge:** Signals sent once per event, ≥2h before release")
