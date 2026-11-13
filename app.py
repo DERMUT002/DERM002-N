@@ -25,7 +25,10 @@ def classify_usd_event(event):
         (r"NON[- ]?FARM|PAYROLL|NFP|AVERAGE HOURLY EARNINGS|WAGE GROWTH", "Employment", 1),
         (r"UNEMPLOYMENT RATE|UNEMPLOYMENT", "Unemployment", -1),
         (r"JOBLESS CLAIMS|INITIAL CLAIMS|CONTINUING CLAIMS", "Jobless claims", -1),
-        (r"\bCPI\b|CONSUMER PRICE INDEX|\bINFLATION\b|\bPCE\b|PERSONAL CONSUMPTION EXPENDITURES|\bPPI\b|PRODUCER PRICE", "Inflation", 1),
+        (r"\bPPI\b|PRODUCER PRICE", "Producer Price Index (PPI)", 1),
+        (r"\bCPI\b|CONSUMER PRICE INDEX", "Consumer Price Index (CPI)", 1),
+        (r"\bPCE\b|PERSONAL CONSUMPTION EXPENDITURES", "Personal Consumption Expenditures Price Index (PCE)", 1),
+        (r"\bINFLATION\b", "Inflation (unspecified measure)", 1),
         (r"\bGDP\b|GROSS DOMESTIC PRODUCT", "GDP", 1),
         (r"RETAIL SALES", "Retail sales", 1),
         (r"\bISM\b|\bPMI\b|PURCHASING MANAGERS", "Business activity", 1),
@@ -136,26 +139,57 @@ def _event_rate_summary(observations):
         lines.append(line + ".")
     return lines
 
-def _event_technical_read(picture):
+def _event_technical_read(picture, market_df=None):
     if not picture:
+        snapshots = []
+    else:
+        snapshots = picture.get("snaps") or []
+    if not picture and (market_df is None or market_df.empty or "Close" not in market_df):
         return {"signal": "UNAVAILABLE", "reasoning": "Multi-timeframe price structure was unavailable."}
+    if not picture:
+        closes = pd.to_numeric(market_df["Close"], errors="coerce").dropna()
+        if len(closes) >= 2 and closes.iloc[-1] != closes.iloc[max(0, len(closes) - 5)]:
+            direction = "BUY" if closes.iloc[-1] > closes.iloc[max(0, len(closes) - 5)] else "SELL"
+            return {
+                "signal": direction,
+                "reasoning": "Low-confidence fallback from the latest available M10 price movement; broader structure is unavailable.",
+            }
+        return {"signal": "UNAVAILABLE", "reasoning": "No price movement is available for a directional read."}
     score = float(picture.get("score") or 0)
     htf_bias = str(picture.get("htf_bias") or "NEUTRAL").upper()
     direction = "BUY" if score >= 2 else "SELL" if score <= -2 else "NEUTRAL"
-    if direction == "BUY" and htf_bias == "BEARISH" and abs(score) < 6:
-        direction = "NEUTRAL"
-    elif direction == "SELL" and htf_bias == "BULLISH" and abs(score) < 6:
-        direction = "NEUTRAL"
+    direction_basis = "weighted multi-timeframe structure"
+    if direction == "NEUTRAL":
+        momentum_score = sum(
+            (1 if str((snapshot.get("micro") or {}).get("momentum", "")).upper() == "BULLISH" else
+             -1 if str((snapshot.get("micro") or {}).get("momentum", "")).upper() == "BEARISH" else 0)
+            * max(float(snapshot.get("weight") or 1), 0.0)
+            for snapshot in snapshots
+        )
+        if momentum_score:
+            direction = "BUY" if momentum_score > 0 else "SELL"
+            direction_basis = "low-conviction weighted timeframe momentum fallback"
+        elif market_df is not None and not market_df.empty and "Close" in market_df:
+            closes = pd.to_numeric(market_df["Close"], errors="coerce").dropna()
+            if len(closes) >= 2 and closes.iloc[-1] != closes.iloc[max(0, len(closes) - 5)]:
+                direction = "BUY" if closes.iloc[-1] > closes.iloc[max(0, len(closes) - 5)] else "SELL"
+                direction_basis = "low-conviction M10 price-movement fallback"
+    htf_conflict = (
+        (direction == "BUY" and htf_bias == "BEARISH")
+        or (direction == "SELL" and htf_bias == "BULLISH")
+    )
+    if htf_conflict:
+        direction_basis = "low-conviction direction against H1/H4 context"
     evidence = (
         picture.get("bull_items", []) if direction == "BUY" else
         picture.get("bear_items", []) if direction == "SELL" else []
     )
-    reason = f"Weighted multi-timeframe structure score {score:+.1f}; H1/H4 context {htf_bias.lower()}."
+    reason = f"{direction_basis.capitalize()}; weighted multi-timeframe structure score {score:+.1f}; H1/H4 context {htf_bias.lower()}."
     if evidence:
         reason += " Evidence: " + "; ".join(evidence[:4]) + "."
     elif direction == "NEUTRAL":
         reason += " Evidence is weak or conflicting; no technical vote."
-    return {"signal": direction, "reasoning": reason}
+    return {"signal": direction, "reasoning": reason, "htf_conflict": htf_conflict}
 
 def _event_liquidity_read(df):
     unavailable = {
@@ -182,8 +216,12 @@ def _event_liquidity_read(df):
         high_distance, low_distance = abs(high - price), abs(price - low)
         if price > high:
             location = f"Price is above the previous UTC calendar-day high by {price - high:.2f}."
+            signal = "BUY"
+            direction_note = "A close beyond the prior high is a tentative breakout signal, not confirmation of continuation."
         elif price < low:
             location = f"Price is below the previous UTC calendar-day low by {low - price:.2f}."
+            signal = "SELL"
+            direction_note = "A close beyond the prior low is a tentative breakout signal, not confirmation of continuation."
         else:
             nearer = (
                 "previous UTC calendar-day high"
@@ -191,12 +229,14 @@ def _event_liquidity_read(df):
                 else "previous UTC calendar-day low"
             )
             location = f"Price is inside the previous-day range; {nearer} is nearer."
+            signal = "NEUTRAL"
+            direction_note = "Proximity to a level alone does not establish direction."
         return {
-            "signal": "NEUTRAL",
+            "signal": signal,
             "reasoning": (
                 f"Price {price:.2f}; previous UTC calendar-day high {high:.2f} "
                 f"({high_distance:.2f} away), low {low:.2f} ({low_distance:.2f} away). "
-                f"{location} Levels are context only and do not predict a sweep or breakout direction."
+                f"{location} {direction_note}"
             ),
         }
     except (TypeError, ValueError, IndexError, KeyError):
@@ -240,23 +280,29 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
     event_type = classify_usd_event(event)
     phase = event.get("analysis_phase", "PRE_RELEASE")
     release = _event_release_assessment(event)
-    technical = _event_technical_read(picture)
+    technical = _event_technical_read(picture, m10)
     liquidity = _event_liquidity_read(m10)
     volatility = _event_volatility_read(m10)
     higher_supports_usd = event_type["mapping"] == "HIGHER_SUPPORTS_USD"
     lower_supports_usd = event_type["mapping"] == "LOWER_SUPPORTS_USD"
     macro_signal = "NEUTRAL"
     macro_reason = (
-        f"{event_type['category']} actual is pending. Compare the eventual actual with "
-        "the supplied consensus, not with the previous value, to identify a surprise. "
+        f"{event_type['category']} actual is "
+        + ("pending. " if release["status"] == "pending" else "published, but no comparable surprise is available. ")
+        + "Compare actual with the supplied consensus, not with the previous value, to identify a surprise. "
     )
     if higher_supports_usd or lower_supports_usd:
         macro_reason += (
             "For this indicator, a "
             + ("higher" if higher_supports_usd else "lower")
             + " reading can support USD; the reverse can weigh on USD. This is a "
-            "conditional historical tendency, not a forecast of the result or a guaranteed gold reaction."
+            "conditional tendency, not a forecast or guaranteed gold reaction."
         )
+        if event_type["category"] == "Producer Price Index (PPI)":
+            macro_reason += (
+                " PPI measures prices received by domestic producers; it is not CPI, "
+                "and pass-through to consumer prices or policy expectations is neither immediate nor one-for-one."
+            )
     else:
         macro_reason += (
             "No generic numeric surprise-to-USD mapping is applied to this event. "
@@ -285,28 +331,54 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
                 f"{release['comparison']} No generic event-to-USD direction is inferred from these supplied values."
             )
     analysts = [
-        {"analyst": f"Macro / {event_type['category']}", "signal": macro_signal, "reasoning": macro_reason},
-        {"analyst": "Technical", "signal": technical["signal"], "reasoning": technical["reasoning"]},
-        {"analyst": "Liquidity", "signal": liquidity["signal"], "reasoning": liquidity["reasoning"]},
+        {"analyst": f"Macro / {event_type['category']}", "signal": macro_signal, "weight": 0.40, "weight_pct": 40, "reasoning": macro_reason},
+        {"analyst": "Technical", "signal": technical["signal"], "weight": 0.35, "weight_pct": 35, "reasoning": technical["reasoning"]},
+        {"analyst": "Liquidity", "signal": liquidity["signal"], "weight": 0.15, "weight_pct": 15, "reasoning": liquidity["reasoning"]},
         {
             "analyst": "Sentiment / positioning",
             "signal": "UNAVAILABLE",
+            "weight": 0.10,
+            "weight_pct": 10,
             "reasoning": (
                 "No current, timestamped COT positioning or gold ETF-flow feed is connected. "
-                "Price movement is not treated as a substitute for sentiment."
+                "COT is weekly and reports Tuesday positions on Friday; price movement is not treated as sentiment."
             ),
         },
         {
             "analyst": "Risk",
             "signal": "RISK ONLY",
+            "weight": 0.0,
+            "weight_pct": 0,
             "reasoning": (
                 f"{volatility['regime']}: {volatility['reasoning']} Higher volatility widens "
-                "outcome uncertainty; it does not imply a sell direction."
+                "outcome uncertainty and can reduce confidence; it does not imply a buy or sell direction."
             ),
         },
     ]
     directional = [a["signal"] for a in analysts if a["signal"] in {"BUY", "SELL"}]
     neutral = sum(a["signal"] == "NEUTRAL" for a in analysts)
+    weighted_votes = [
+        (1 if analyst["signal"] == "BUY" else -1, analyst["weight"])
+        for analyst in analysts
+        if analyst["signal"] in {"BUY", "SELL"} and analyst["weight"] > 0
+    ]
+    available_weight = sum(weight for _, weight in weighted_votes)
+    weighted_score = (
+        round(100 * sum(vote * weight for vote, weight in weighted_votes) / available_weight)
+        if available_weight
+        else 0
+    )
+    weighted_direction = "BUY" if weighted_score > 0 else "SELL" if weighted_score < 0 else None
+    if weighted_direction is None and technical["signal"] in {"BUY", "SELL"}:
+        weighted_direction = technical["signal"]
+    weighted_confidence = (
+        "MEDIUM"
+        if len(weighted_votes) >= 2
+        and abs(weighted_score) >= 60
+        and volatility["regime"] != "EXPANDED"
+        and not technical.get("htf_conflict")
+        else "LOW"
+    )
     if higher_supports_usd or lower_supports_usd:
         if higher_supports_usd:
             above, below = "USD-supportive and gold-negative", "USD-negative and gold-supportive"
@@ -334,6 +406,23 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
             "NEUTRAL": neutral,
             "NONVOTING": len(analysts) - len(directional) - neutral,
         },
+        "weighted_decision": {
+            "signal": weighted_direction,
+            "score": weighted_score,
+            "confidence": weighted_confidence,
+            "available_directional_weight": round(available_weight, 2),
+            "available_directional_weight_pct": round(100 * available_weight),
+            "risk_adjustment": (
+                "Confidence capped at LOW because observed volatility is expanded."
+                if volatility["regime"] == "EXPANDED"
+                else "No additional confidence adjustment from the current volatility regime."
+            ),
+            "note": (
+                "Heuristic directional evidence score, not a calibrated probability. "
+                "Weights are renormalized over available BUY/SELL evidence; unavailable or "
+                "nondirectional factors do not cast invented votes. Risk modifies confidence, not direction."
+            ),
+        },
         "volatility_regime": volatility["regime"],
         "rates_context": rates_context,
         "scenarios": scenarios,
@@ -349,7 +438,9 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
         ),
         "quality_note": (
             "Signals are evidence summaries, not independent experts or validated probabilities. "
-            "Liquidity is nondirectional, risk is not a vote, and sentiment is unavailable without a live, dated source."
+            "Liquidity votes only on a close outside the prior UTC day range; sentiment is unavailable "
+            "without a dated feed; risk is a confidence modifier, not a direction vote. Weights are heuristic, "
+            "not optimized or validated on out-of-sample results."
         ),
     }
 
@@ -1744,7 +1835,7 @@ NEWS_EVENT_KNOWLEDGE = {
     "JOBLESS CLAIMS": ("fewer claims = stronger USD", "Weekly claims: lower prints support USD, higher prints weaken it. USD-sensitive MEDIUM impact."),
     "RETAIL SALES": ("stronger USD on upside surprise", "Strong retail sales support USD; weak sales weigh on USD."),
     "PMI": ("above-consensus PMI = stronger USD", "ISM/Flash PMI above expectations supports USD; below weighs. Watch the 50 line."),
-    "PPI": ("hotter PPI = stronger USD", "Producer inflation feeds CPI expectations; hotter prints support USD."),
+    "PPI": ("hotter PPI can support USD", "PPI measures prices received by domestic producers, not consumer prices. Pass-through and policy implications are incomplete and lagged; assess the supplied PPI surprise and components rather than treating PPI as CPI."),
     "PCE": ("hotter core PCE = stronger USD", "Fed's preferred gauge. Hotter core PCE lifts USD and hits gold; cooler does the opposite."),
     "FED": ("hawkish Fed = stronger USD", "Fed communication reprices rate expectations and moves USD across pairs."),
     "INTEREST RATE": ("higher/hawkish = stronger USD", "Rate decisions move USD via yield differentials."),
@@ -2073,7 +2164,7 @@ RELEASE-DATA METHOD:
 1. Separate calendar Actual, Forecast (consensus), and Previous. Forecast versus Previous is an expected change, NOT a surprise. Only compare Actual with Forecast to assess a surprise, and compare Actual with Previous to assess the change from the last release. Use the supplied comparison calculations when present.
 2. An empty/unavailable Actual is not zero and is not a released value. For a future event, say the actual is pending and assess scenarios: above/below consensus. Do not state a definite surprise direction before the release.
 3. FRED observations are the latest reported indicator periods. Their period dates may lag this calendar month. Compare the latest period with the prior period and describe the measured change, but never call it this month's event actual unless the dates and release context prove that they are the same release. FRED does not provide consensus; do not infer one.
-4. Interpret whether a higher or lower value supports USD based on the indicator (for example, stronger payroll growth or hotter inflation can support USD; higher unemployment or claims can weigh on USD). A numeric increase alone does not determine USD direction. Consider revisions, the forecast, the prior value, and mixed components where supplied.
+4. Interpret whether a higher or lower value supports USD based on the specific indicator (for example, stronger payroll growth, hotter CPI, or hotter PPI can conditionally support USD; higher unemployment or claims can weigh on USD). PPI is a producer-price measure, not CPI; do not describe it as a consumer inflation release. A numeric increase alone does not determine USD direction. Consider revisions, the forecast, the prior value, and mixed components where supplied.
 
 PAIR-DIRECTION METHOD:
 First state the likely USD effect and confidence. Then map it to the instrument's quote convention: for a pair BASE/QUOTE, stronger USD raises the pair when USD is BASE and usually lowers it when USD is QUOTE; weaker USD usually reverses that. XAUUSD and EURUSD have USD as QUOTE. For BTCUSD and US30, USD/yield effects can be outweighed by risk appetite, liquidity, or growth expectations, so do not claim a mechanical inverse correlation. If the instrument or currency exposure is unclear, say so. Use current DXY and price structure as confirmation or contradiction, not as proof of the event outcome.
@@ -2083,11 +2174,11 @@ ANALYSIS ORDER:
 - Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
 - Macro transmission: explain how this event and the supplied data may alter Fed/rate expectations, yields, and USD; distinguish a likely tendency from a certain outcome. For unreleased events, assess the most likely direction from available expectations and context, but explicitly say when the release outcome itself is unknown.
 - Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
-- Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Forecast versus previous describes the consensus expected change; it is not the surprise and must not be used to predict the unreleased actual or justify a directional trade. Before release, select BUY/SELL only when current gold market evidence supports that direction; use WAIT when evidence is weak or conflicting. A Python gate independently requires the model direction to agree with the market direction and at least three usable timeframes with a minimum 50/100 evidence-alignment score. Never invent that score or present it as a probability. Pre-release confidence cannot exceed MEDIUM. After release, return BUY or SELL only when actual and forecast are present and comparable, the surprise direction is clear for this indicator, the likely USD impact and gold effect are supported, and directional evidence confirms the side. If the event/macro mapping or technical read materially conflicts with the model, return WAIT and identify why. Do not provide entry, stop-loss, or take-profit prices.
+- Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Forecast versus previous describes the consensus expected change; it is not the surprise and must not be used to predict an unreleased actual. Provide a BUY/SELL market-context lean when price data exists, even if evidence is weak; mark it LOW confidence and explain limitations rather than substituting a made-up release prediction. The Python gate calculates the final direction from available evidence and labels low-evidence fallback leans. Never invent a score or present it as a probability. Confidence cannot exceed MEDIUM without calibrated validation. After release, use the actual-vs-consensus surprise and event-specific mapping when comparable; if unavailable or mixed, make clear the news did not establish the direction and use only the market-context lean. Do not provide entry, stop-loss, or take-profit prices.
 - Reasoning: for a PRE_RELEASE lean, identify it as a market-context bias, cite available data and uncertainty, and include conditional scenarios. For POST_RELEASE, cite actual, forecast, surprise, likely USD/rates channel, gold reaction evidence, and the strongest caveat. For WAIT, state why evidence is insufficient. Never invent sources or values.
 - Never invent a percentage probability or treat a confidence label/confluence score as a calibrated probability. Do not assign odds to any event outcome unless a supplied, validated forecast-error model provides those odds. Higher realized volatility increases uncertainty and is not directional evidence.
 - The calendar forecast being higher/lower than the previous release is not evidence that the actual will beat/miss forecast. Before release, describe that only as the consensus expected change, then keep above/in-line/below outcomes conditional.
-- For any USD event, use the supplied event evidence council. Apply an event-specific numeric surprise mapping only when explicitly supported; otherwise leave macro direction unknown. Liquidity proximity is not a forecast of a sweep; risk is not a directional vote; sentiment is unavailable unless a dated positioning/flow source is supplied. Do not claim COT or ETF flows when absent.
+- For any USD event, use the supplied event evidence council. Keep PPI, CPI, and PCE identified separately; PPI is a producer-price measure, not CPI. Apply only the event-specific surprise mapping and label it conditional. Liquidity proximity is not directional; only an observed close outside the prior-day range can cast a tentative liquidity vote. Risk modifies confidence, not direction. Sentiment is unavailable unless a dated positioning/flow source is supplied; COT is weekly and lagged. Do not claim COT or ETF flows when absent.
 
 DATA PROVIDED:
 {data_summary}
@@ -2493,11 +2584,19 @@ def enforce_news_signal_gate(analysis, event):
             analysis['bias'] = 'BULLISH' if signal == 'BUY' else 'BEARISH'
             analysis['direction_type'] = 'PRE_RELEASE_LEAN'
             analysis['candidate_direction'] = market_direction
-            analysis['confidence'] = evidence.get('confidence', 'LOW')
+            expanded_risk = (
+                (analysis.get('news_evidence_council') or {}).get('volatility_regime')
+                == 'EXPANDED'
+            )
+            analysis['confidence'] = (
+                'LOW' if expanded_risk else evidence.get('confidence', 'LOW')
+            )
             analysis['confluence_score'] = evidence['score']
             analysis['decision_gate_reason'] = (
                 f"{signal} lean passed the evidence gate: {evidence['reason']} "
-                f"Confidence is {analysis['confidence']}; this is evidence alignment, "
+                f"Confidence is {analysis['confidence']}"
+                + (" because volatility is expanded; " if expanded_risk else "; ")
+                + "this is evidence alignment, "
                 "not a win probability, and the release outcome remains unknown."
             )
             analysis['rejection_reason'] = ''
@@ -2550,18 +2649,58 @@ def enforce_news_signal_gate(analysis, event):
         else:
             evidence = analysis.get('post_release_evidence') or {}
             analysis['confluence_score'] = evidence.get('score', 0)
+        council = analysis.get('news_evidence_council') or {}
+        factor_rows = council.get('analysts') or []
+        technical_direction = (
+            factor_rows[1].get('signal')
+            if len(factor_rows) > 1 and isinstance(factor_rows[1], dict)
+            else None
+        )
+        weighted_direction = (council.get('weighted_decision') or {}).get('signal')
+        fallback_direction = next(
+            (
+                normalize_ai_signal(candidate)
+                for candidate in (
+                    analysis.get('market_context_direction'),
+                    analysis.get('candidate_direction'),
+                    weighted_direction,
+                    technical_direction,
+                )
+                if normalize_ai_signal(candidate) in {'BUY', 'SELL'}
+            ),
+            None,
+        )
         analysis['confidence'] = 'LOW'
-        analysis['signal'] = 'WAIT'
-        analysis['candidate_direction'] = 'WAIT'
-        analysis['decision_gate_reason'] = reason
+        if fallback_direction:
+            analysis['signal'] = fallback_direction
+            analysis['bias'] = 'BULLISH' if fallback_direction == 'BUY' else 'BEARISH'
+            analysis['candidate_direction'] = fallback_direction
+            analysis['direction_type'] = (
+                'PRE_RELEASE_LEAN' if phase != 'POST_RELEASE' else 'LOW_CONFIDENCE_MARKET_LEAN'
+            )
+            analysis['decision_gate_reason'] = (
+                f"{reason} Publishing a LOW-confidence {fallback_direction} market-context lean "
+                "from available price evidence so the output is directional; this is not a "
+                "validated probability or a claim that the event supports this side."
+            )
+        else:
+            analysis['signal'] = 'WAIT'
+            analysis['candidate_direction'] = 'WAIT'
+            analysis['decision_gate_reason'] = reason
         analysis['rejection_reason'] = reason
     else:
         evidence = analysis.get('post_release_evidence') or {}
-        analysis['confidence'] = 'MEDIUM'
+        expanded_risk = (
+            (analysis.get('news_evidence_council') or {}).get('volatility_regime')
+            == 'EXPANDED'
+        )
+        analysis['confidence'] = 'LOW' if expanded_risk else 'MEDIUM'
         analysis['confluence_score'] = evidence['score']
         analysis['decision_gate_reason'] = (
             f"Released actual/forecast, event mapping, and directional evidence agree. "
-            f"{evidence['reason']} Confidence is MEDIUM; the score is evidence alignment, "
+            f"{evidence['reason']} Confidence is {analysis['confidence']}"
+            + (" because volatility is expanded; " if expanded_risk else "; ")
+            + "the score is evidence alignment, "
             "not a win probability."
         )
     return analysis
@@ -2715,7 +2854,13 @@ def analyze_news_for_symbol(symbol, all_data, event):
         analysis['atr'] = setup_context.get('atr')
         analysis['score_reason'] = structural_context['score_reason']
         analysis['candidate_direction'] = structural_context['candidate_direction']
-        analysis['market_context_direction'] = firm or ledger.get('direction') or structural_context.get('candidate_direction')
+        analysis['market_context_direction'] = (
+            news_evidence["weighted_decision"].get("signal")
+            or firm
+            or ledger.get('direction')
+            or structural_context.get('candidate_direction')
+            or news_evidence["analysts"][1].get("signal")
+        )
         analysis['gold_macro_context'] = gold_macro_context
         analysis['is_news_signal'] = True
         
@@ -2767,16 +2912,23 @@ def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_conte
     if htf_context:
         htf_dir = htf_context.get('trend') or htf_context.get('bias')
     phase = (news_context or {}).get("analysis_phase", "PRE_RELEASE")
-    market_direction = firm if firm in {"BUY", "SELL"} else None
+    technical_read = _event_technical_read(picture, m10)
+    market_direction = (
+        firm
+        if firm in {"BUY", "SELL"}
+        else technical_read.get("signal")
+        if technical_read.get("signal") in {"BUY", "SELL"}
+        else None
+    )
     signal = market_direction if phase == "PRE_RELEASE" else "WAIT"
     reasoning = "{} analysis for {} (fallback, AI unavailable). ".format(phase.replace("_", " ").title(), symbol)
     if signal in {"BUY", "SELL"}:
-        reasoning += f"Candidate {signal} market-context lean from Python's firm multi-timeframe read; it is not a prediction of the unreleased result. "
+        reasoning += f"Candidate {signal} market-context lean from Python price evidence; it is not a prediction of the unreleased result. "
         reasoning += "The evidence gate may reject this candidate if timeframe alignment is insufficient. Higher-timeframe trend: {}.".format(htf_dir or "unavailable")
     else:
-        reasoning += "No verified event-to-USD-to-instrument assessment was produced. "
-        reasoning += "Higher-timeframe trend: {}. It is context only and is not sufficient to infer the news impact. ".format(htf_dir or "unavailable")
-        reasoning += "Wait for a successful analysis and verified release data."
+        reasoning += "A directional price read could not be calculated from the available data. "
+        reasoning += "Higher-timeframe trend: {}. It is context only and is not sufficient to infer event impact. ".format(htf_dir or "unavailable")
+        reasoning += "The analysis needs usable market-price data before a direction can be reported."
     
     return {
         "bias": "BULLISH" if signal == "BUY" else "BEARISH" if signal == "SELL" else "RANGING",
@@ -2787,12 +2939,18 @@ def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_conte
         "microstructure_read": "VWAP {} | RVOL {}".format(micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0)),
         "pre_news_bias": (news_context or {}).get("pre_news_bias", "News-driven reaction expected"),
         "reasoning": reasoning,
-        "rejection_reason": "" if signal in {"BUY", "SELL"} else "AI analysis unavailable; no directional market context is available.",
+        "rejection_reason": "" if signal in {"BUY", "SELL"} else "AI unavailable and market-price data did not support a directional lean.",
         "structural_score": 0,
         "score_reason": "No verified news-impact assessment available.",
         "candidate_direction": signal,
         "market_context_direction": market_direction,
-        "direction_type": "PRE_RELEASE_LEAN" if signal in {"BUY", "SELL"} else None,
+        "direction_type": (
+            "PRE_RELEASE_LEAN"
+            if signal in {"BUY", "SELL"} and firm in {"BUY", "SELL"}
+            else "LOW_CONFIDENCE_MARKET_LEAN"
+            if signal in {"BUY", "SELL"}
+            else None
+        ),
         "levels_source": "PYTHON",
         "historical_pattern": historical_context or "",
         "api_status": "FALLBACK",
@@ -2910,7 +3068,7 @@ with tab2:
         st.markdown("- Compares released actuals with consensus and prior values when available")
         st.markdown("- Maps the event's currency impact to each instrument and quote convention")
         st.markdown("- Cross-checks gold structure, DXY, supplied release history, and FRED Treasury yields when configured")
-        st.markdown("- Shows conditional scenarios before release; abstains when evidence is incomplete or conflicting")
+        st.markdown("- Shows a market-context BUY/SELL lean when price data exists; incomplete or conflicting evidence is labeled LOW confidence")
         st.markdown("- Shares directional assessments with Telegram; these are not execution instructions")
 
         selected_event = None
@@ -2940,10 +3098,7 @@ with tab2:
             st.markdown("---")
 
         if selected_event:
-            if not get_secret("GROQ_API_KEY"):
-                st.error("⚠️ Please set your GROQ_API_KEY in Streamlit Secrets.")
-            else:
-                with st.spinner(f"Fetching market data and analysing {selected_event['event']}..."):
+            with st.spinner(f"Fetching market data and analysing {selected_event['event']}..."):
                     all_data = fetch_all_data()
                     st.session_state.cached_market_data = all_data
                     
@@ -2964,7 +3119,11 @@ with tab2:
                             st.markdown(f"**🤖 AI Model:** `{model_used}` | **🔋 Tokens Used:** `{total_tokens}` (Prompt: {prompt_tokens}, Completion: {completion_tokens}) | **📡 Status:** <span style='color:{status_color}; font-weight:bold;'>{api_status}</span>", unsafe_allow_html=True)
                             
                             if api_status == 'FALLBACK' and analysis.get('groq_failure'):
-                                st.warning(f"Groq unavailable ({analysis.get('groq_api_status', 'UNKNOWN')}): {analysis['groq_failure']}")
+                                st.warning(
+                                    f"AI unavailable ({analysis.get('groq_api_status', 'UNKNOWN')}): "
+                                    f"{analysis['groq_failure']} Python will report a low-confidence "
+                                    "market-context lean when price data supports one."
+                                )
                                 
                             if api_status not in ['SUCCESS', 'SUCCESS_EXTRACTED', 'FALLBACK']:
                                 with st.expander("🐛 Debug AI Response (Why it failed)"):
@@ -2975,9 +3134,16 @@ with tab2:
                             if news_evidence:
                                 st.subheader("Event evidence council")
                                 st.caption(
-                                    "Directional evidence is separated from risk and nondirectional liquidity. "
-                                    "This is not a set of independent analysts or calibrated probabilities."
+                                    "Directional votes are weighted only when supported by data. "
+                                    "Risk changes confidence, not direction; missing inputs do not cast invented votes."
                                 )
+                                decision = news_evidence.get("weighted_decision", {})
+                                st.metric(
+                                    "Weighted market-context lean",
+                                    decision.get("signal") or "No directional evidence",
+                                    f"Evidence score: {decision.get('score', 0):+d}/100 · {decision.get('confidence', 'LOW')} confidence",
+                                )
+                                st.caption(decision.get("note", ""))
                                 st.write(
                                     "**Event classification:**",
                                     news_evidence["event_type"]["category"],
@@ -2992,7 +3158,9 @@ with tab2:
                                 )
                                 st.caption(news_evidence["scope_note"])
                                 st.dataframe(
-                                    pd.DataFrame(news_evidence["analysts"]),
+                                    pd.DataFrame(news_evidence["analysts"]).rename(
+                                        columns={"weight_pct": "weight (%)"}
+                                    ),
                                     use_container_width=True,
                                     hide_index=True,
                                 )
