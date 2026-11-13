@@ -139,6 +139,73 @@ def _event_rate_summary(observations):
         lines.append(line + ".")
     return lines
 
+def _event_macro_market_read(observations, dxy_context=None):
+    votes = []
+    yield_votes = []
+    details = []
+    for label, series_id in (
+        ("2-year nominal yield", "DGS2"),
+        ("10-year real yield", "DFII10"),
+    ):
+        series = observations.get(series_id) or []
+        if len(series) < 2:
+            continue
+        try:
+            latest_date = datetime.strptime(series[0]["date"], "%Y-%m-%d").date()
+            age_days = (datetime.now(timezone.utc).date() - latest_date).days
+            if age_days < 0 or age_days > 5:
+                continue
+            latest = float(series[0]["value"])
+            baseline = float(series[min(4, len(series) - 1)]["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        change = latest - baseline
+        if abs(change) < 0.02:
+            continue
+        direction = "SELL" if change > 0 else "BUY"
+        votes.append(direction)
+        yield_votes.append(direction)
+        details.append(
+            f"{label} {change:+.3f} percentage points conditionally favors {direction} XAUUSD"
+        )
+
+    dxy = dxy_context or {}
+    dxy_trend = str(dxy.get("trend") or "").upper()
+    dxy_vwap = str(dxy.get("price_vs_vwap") or "").upper()
+    if dxy_trend == "BULLISH" and dxy_vwap == "ABOVE":
+        votes.append("SELL")
+        details.append("DXY is bullish and above VWAP, a USD-strength context favoring SELL XAUUSD")
+    elif dxy_trend == "BEARISH" and dxy_vwap == "BELOW":
+        votes.append("BUY")
+        details.append("DXY is bearish and below VWAP, a USD-weakness context favoring BUY XAUUSD")
+
+    buys = votes.count("BUY")
+    sells = votes.count("SELL")
+    signal = "BUY" if buys > sells else "SELL" if sells > buys else "NEUTRAL"
+    yield_buys = yield_votes.count("BUY")
+    yield_sells = yield_votes.count("SELL")
+    yield_signal = (
+        "BUY" if yield_buys > yield_sells
+        else "SELL" if yield_sells > yield_buys
+        else "NEUTRAL"
+    )
+    if not votes:
+        reason = "Recent directional yield/DXY context is unavailable or inconclusive."
+    elif buys == sells:
+        reason = "Yield and DXY context conflict; no macro market-context vote. " + "; ".join(details) + "."
+    else:
+        reason = (
+            f"Current macro-market backdrop leans {signal}, based on {max(buys, sells)} "
+            f"of {len(votes)} available yield/DXY observations. This describes current "
+            "repricing, not the pending event's surprise. " + "; ".join(details) + "."
+        )
+    return {
+        "signal": signal,
+        "yield_signal": yield_signal,
+        "reasoning": reason,
+        "votes": votes,
+    }
+
 def _event_technical_read(picture, market_df=None):
     if not picture:
         snapshots = []
@@ -276,7 +343,7 @@ def _event_volatility_read(df):
     except (TypeError, ValueError, IndexError, KeyError):
         return unavailable
 
-def build_news_evidence_council(event, picture, m10, rate_observations=None):
+def build_news_evidence_council(event, picture, m10, rate_observations=None, dxy_context=None):
     event_type = classify_usd_event(event)
     phase = event.get("analysis_phase", "PRE_RELEASE")
     release = _event_release_assessment(event)
@@ -285,11 +352,13 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
     volatility = _event_volatility_read(m10)
     higher_supports_usd = event_type["mapping"] == "HIGHER_SUPPORTS_USD"
     lower_supports_usd = event_type["mapping"] == "LOWER_SUPPORTS_USD"
-    macro_signal = "NEUTRAL"
+    macro_market = _event_macro_market_read(rate_observations or {}, dxy_context)
+    macro_signal = macro_market["signal"]
     macro_reason = (
         f"{event_type['category']} actual is "
         + ("pending. " if release["status"] == "pending" else "published, but no comparable surprise is available. ")
         + "Compare actual with the supplied consensus, not with the previous value, to identify a surprise. "
+        + macro_market["reasoning"]
     )
     if higher_supports_usd or lower_supports_usd:
         macro_reason += (
@@ -327,18 +396,20 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
                 "surprise; details, revisions, expectations already priced in, and market repricing can dominate."
             )
         else:
+            macro_signal = macro_market["signal"]
             macro_reason = (
-                f"{release['comparison']} No generic event-to-USD direction is inferred from these supplied values."
+                f"{release['comparison']} The release does not establish a numeric event direction. "
+                + macro_market["reasoning"]
             )
     analysts = [
-        {"analyst": f"Macro / {event_type['category']}", "signal": macro_signal, "weight": 0.40, "weight_pct": 40, "reasoning": macro_reason},
-        {"analyst": "Technical", "signal": technical["signal"], "weight": 0.35, "weight_pct": 35, "reasoning": technical["reasoning"]},
-        {"analyst": "Liquidity", "signal": liquidity["signal"], "weight": 0.15, "weight_pct": 15, "reasoning": liquidity["reasoning"]},
+        {"analyst": f"Macro Economist / {event_type['category']}", "signal": macro_signal, "weight": 0.25, "weight_pct": 25, "reasoning": macro_reason},
+        {"analyst": "Technical Analyst", "signal": technical["signal"], "weight": 0.25, "weight_pct": 25, "reasoning": technical["reasoning"]},
+        {"analyst": "Liquidity", "signal": liquidity["signal"], "weight": 0.25, "weight_pct": 25, "reasoning": liquidity["reasoning"]},
         {
             "analyst": "Sentiment / positioning",
             "signal": "UNAVAILABLE",
-            "weight": 0.10,
-            "weight_pct": 10,
+            "weight": 0.25,
+            "weight_pct": 25,
             "reasoning": (
                 "No current, timestamped COT positioning or gold ETF-flow feed is connected. "
                 "COT is weekly and reports Tuesday positions on Friday; price movement is not treated as sentiment."
@@ -369,8 +440,6 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
         else 0
     )
     weighted_direction = "BUY" if weighted_score > 0 else "SELL" if weighted_score < 0 else None
-    if weighted_direction is None and technical["signal"] in {"BUY", "SELL"}:
-        weighted_direction = technical["signal"]
     weighted_confidence = (
         "MEDIUM"
         if len(weighted_votes) >= 2
@@ -420,15 +489,45 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
             "note": (
                 "Heuristic directional evidence score, not a calibrated probability. "
                 "Weights are renormalized over available BUY/SELL evidence; unavailable or "
-                "nondirectional factors do not cast invented votes. Risk modifies confidence, not direction."
+                "nondirectional factors do not cast invented votes. Macro, technical, liquidity, and "
+                "sentiment use equal provisional weights; risk modifies confidence, not direction. "
+                "Weights are not calibrated from historical outcomes."
             ),
         },
         "volatility_regime": volatility["regime"],
+        "macro_market": macro_market,
         "rates_context": rates_context,
         "scenarios": scenarios,
+        "scenario_outcomes": (
+            [
+                {
+                    "outcome": "Below consensus",
+                    "conditional_effect": below,
+                    "probability": "Not calibrated",
+                },
+                {
+                    "outcome": "Match consensus",
+                    "conditional_effect": "No clear headline surprise; revisions and repricing may dominate.",
+                    "probability": "Not calibrated",
+                },
+                {
+                    "outcome": "Above consensus",
+                    "conditional_effect": above,
+                    "probability": "Not calibrated",
+                },
+            ]
+            if higher_supports_usd or lower_supports_usd
+            else []
+        ),
         "probability_note": (
             "Scenario probabilities are not shown: no forecast-error dataset or "
             "out-of-sample calibrated probability model is connected."
+        ),
+        "research_note": (
+            "IMF event-study research reports that gold responds to selected scheduled "
+            "US and euro-area activity and interest-rate announcements differently from "
+            "other commodities. This supports event-specific analysis, not a directional "
+            "or probability forecast for this release."
         ),
         "scope_note": (
             "This assessment uses the selected calendar row; the calendar feed is not treated "
@@ -439,8 +538,8 @@ def build_news_evidence_council(event, picture, m10, rate_observations=None):
         "quality_note": (
             "Signals are evidence summaries, not independent experts or validated probabilities. "
             "Liquidity votes only on a close outside the prior UTC day range; sentiment is unavailable "
-            "without a dated feed; risk is a confidence modifier, not a direction vote. Weights are heuristic, "
-            "not optimized or validated on out-of-sample results."
+            "without a dated feed; risk is a confidence modifier, not a direction vote. "
+            "Equal starting weights are heuristic, not validated out of sample."
         ),
     }
 
@@ -2174,7 +2273,7 @@ ANALYSIS ORDER:
 - Release comparison: state actual, forecast, previous, actual-vs-forecast surprise, and actual/forecast-vs-previous change only when supplied and comparable.
 - Macro transmission: explain how this event and the supplied data may alter Fed/rate expectations, yields, and USD; distinguish a likely tendency from a certain outcome. For unreleased events, assess the most likely direction from available expectations and context, but explicitly say when the release outcome itself is unknown.
 - Instrument response: map the likely USD effect to this exact symbol, then weigh its own drivers and supplied market structure, DXY, timeframe, and microstructure. For XAUUSD, stronger USD normally pressures gold and weaker USD normally supports it; explain any stronger safe-haven or technical evidence that changes that base case.
-- Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Forecast versus previous describes the consensus expected change; it is not the surprise and must not be used to predict an unreleased actual. Provide a BUY/SELL market-context lean when price data exists, even if evidence is weak; mark it LOW confidence and explain limitations rather than substituting a made-up release prediction. The Python gate calculates the final direction from available evidence and labels low-evidence fallback leans. Never invent a score or present it as a probability. Confidence cannot exceed MEDIUM without calibrated validation. After release, use the actual-vs-consensus surprise and event-specific mapping when comparable; if unavailable or mixed, make clear the news did not establish the direction and use only the market-context lean. Do not provide entry, stop-loss, or take-profit prices.
+- Decision: distinguish POST_RELEASE assessment from PRE_RELEASE lean. Forecast versus previous describes the consensus expected change; it is not the surprise and must not be used to predict an unreleased actual. Before release, the macro view may summarize recent, dated Treasury-yield and DXY direction as current market context, never as the event outcome. Provide a BUY/SELL market-context lean when price data exists, even if evidence is weak; mark it LOW confidence and explain limitations rather than substituting a made-up release prediction. The Python gate calculates the final direction from available evidence and labels low-evidence fallback leans. Never invent a score or present it as a probability. Confidence cannot exceed MEDIUM without calibrated validation. After release, use the actual-vs-consensus surprise and event-specific mapping when comparable; if unavailable or mixed, make clear the news did not establish the direction and use only the market-context lean. Do not provide entry, stop-loss, or take-profit prices.
 - Reasoning: for a PRE_RELEASE lean, identify it as a market-context bias, cite available data and uncertainty, and include conditional scenarios. For POST_RELEASE, cite actual, forecast, surprise, likely USD/rates channel, gold reaction evidence, and the strongest caveat. For WAIT, state why evidence is insufficient. Never invent sources or values.
 - Never invent a percentage probability or treat a confidence label/confluence score as a calibrated probability. Do not assign odds to any event outcome unless a supplied, validated forecast-error model provides those odds. Higher realized volatility increases uncertainty and is not directional evidence.
 - The calendar forecast being higher/lower than the previous release is not evidence that the actual will beat/miss forecast. Before release, describe that only as the consensus expected change, then keep above/in-line/below outcomes conditional.
@@ -2803,6 +2902,7 @@ def analyze_news_for_symbol(symbol, all_data, event):
             picture,
             m10,
             st.session_state.get('_gold_macro_observations_cache', {}),
+            dxy_context,
         )
         
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
@@ -3063,7 +3163,7 @@ with tab2:
     if not st.session_state.fetched_news:
         st.warning("⚠️ No news fetched yet. Please go to the 'Fetch News' tab and fetch the calendar first.")
     else:
-        st.info(f"Ready to analyse {len(st.session_state.fetched_news)} events across {', '.join(NEWS_ANALYSIS_SYMBOLS)} using Groq AI.")
+        st.info(f"Ready to analyse {len(st.session_state.fetched_news)} events across {', '.join(NEWS_ANALYSIS_SYMBOLS)} using market evidence and optional Groq AI.")
         st.markdown("**Analysis Process:**")
         st.markdown("- Compares released actuals with consensus and prior values when available")
         st.markdown("- Maps the event's currency impact to each instrument and quote convention")
@@ -3134,16 +3234,34 @@ with tab2:
                             if news_evidence:
                                 st.subheader("Event evidence council")
                                 st.caption(
-                                    "Directional votes are weighted only when supported by data. "
-                                    "Risk changes confidence, not direction; missing inputs do not cast invented votes."
+                                    "Five-factor council summary. Available directional factors receive equal provisional weights; "
+                                    "risk is a confidence modifier, and missing data does not cast an invented vote."
                                 )
                                 decision = news_evidence.get("weighted_decision", {})
+                                tally = news_evidence.get("tally", {})
+                                context_cols = st.columns(5)
+                                context_cols[0].metric("Volatility", news_evidence.get("volatility_regime", "UNAVAILABLE"))
+                                context_cols[1].metric("Event", news_evidence["event_type"]["category"])
+                                context_cols[2].metric("Gold lean", decision.get("signal") or "UNAVAILABLE")
+                                context_cols[3].metric(
+                                    "Yield context",
+                                    (news_evidence.get("macro_market") or {}).get("yield_signal", "UNAVAILABLE"),
+                                )
+                                context_cols[4].metric(
+                                    "Council tally",
+                                    f"BUY {tally.get('BUY', 0)} / SELL {tally.get('SELL', 0)}",
+                                )
                                 st.metric(
                                     "Weighted market-context lean",
                                     decision.get("signal") or "No directional evidence",
-                                    f"Evidence score: {decision.get('score', 0):+d}/100 · {decision.get('confidence', 'LOW')} confidence",
+                                    (
+                                        f"Directional balance: {decision.get('score', 0):+d}/100 · "
+                                        f"{decision.get('available_directional_weight_pct', 0)}% of assigned weight available"
+                                    ),
                                 )
+                                st.caption(f"Confidence: {decision.get('confidence', 'LOW')}")
                                 st.caption(decision.get("note", ""))
+                                st.caption(decision.get("risk_adjustment", ""))
                                 st.write(
                                     "**Event classification:**",
                                     news_evidence["event_type"]["category"],
@@ -3157,17 +3275,32 @@ with tab2:
                                     news_evidence["release"]["surprise_direction"],
                                 )
                                 st.caption(news_evidence["scope_note"])
+                                analyst_table = pd.DataFrame(news_evidence["analysts"]).rename(
+                                    columns={
+                                        "analyst": "Analyst",
+                                        "signal": "Signal",
+                                        "weight_pct": "Weight (%)",
+                                        "reasoning": "Reasoning",
+                                    }
+                                )
                                 st.dataframe(
-                                    pd.DataFrame(news_evidence["analysts"]).rename(
-                                        columns={"weight_pct": "weight (%)"}
-                                    ),
+                                    analyst_table[["Analyst", "Signal", "Weight (%)", "Reasoning"]],
                                     use_container_width=True,
                                     hide_index=True,
                                 )
-                                st.write("**Scenario map (conditional, not probability-weighted):**")
-                                for scenario in news_evidence["scenarios"]:
-                                    st.write(f"- {scenario}")
+                                st.write("**Decision drivers:** factor signals and equal provisional vote weights are shown above; the weighted score is not a probability.")
+                                scenario_outcomes = news_evidence.get("scenario_outcomes") or []
+                                if scenario_outcomes:
+                                    st.write("**Event outcomes (conditional; probabilities unavailable):**")
+                                    st.dataframe(
+                                        pd.DataFrame(scenario_outcomes),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                                else:
+                                    st.write("**Event outcomes:** numeric outcome probabilities are unavailable for this event mapping.")
                                 st.info(news_evidence["probability_note"])
+                                st.caption(news_evidence["research_note"])
                                 st.caption(news_evidence["quality_note"])
                                 event_sources = build_event_source_references(event)
                                 if event_sources:
@@ -3183,6 +3316,8 @@ with tab2:
                                     "these links are references, not verification of the feed values."
                                 )
                                 st.markdown(
+                                    "[IMF research: economic news and gold](https://doi.org/10.5089/9781451872873.001.a001) · "
+                                    "[Announcement volatility research](https://doi.org/10.1002/fut.21922) · "
                                     "[FRED 2-year yield](https://fred.stlouisfed.org/series/DGS2) · "
                                     "[FRED 10-year yield](https://fred.stlouisfed.org/series/DGS10) · "
                                     "[FRED 10-year real yield](https://fred.stlouisfed.org/series/DFII10) · "
@@ -3195,6 +3330,15 @@ with tab2:
                                         st.write(f"- {rate_line}")
                             
                             sig = analysis.get('signal', 'SKIPPED')
+                            if sig in ('BUY', 'SELL'):
+                                st.subheader("Analyst Verdict")
+                                verdict_cols = st.columns(3)
+                                verdict_cols[0].metric("Analyst verdict", f"{sig} XAUUSD")
+                                verdict_cols[1].metric(
+                                    "Volatility regime",
+                                    (news_evidence or {}).get("volatility_regime", "UNAVAILABLE"),
+                                )
+                                verdict_cols[2].metric("Confidence", analysis.get("confidence", "LOW"))
                             if sig in ('BUY', 'SELL'):
                                 sig_emoji = "🟢" if sig == 'BUY' else "🔴"
                                 css_class = "buy-signal" if sig == 'BUY' else "sell-signal"
@@ -3320,10 +3464,11 @@ with tab4:
 
 with tab5:
     st.header("⚙️ System Settings")
-    st.info("Ensure `GROQ_API_KEY`, `FRED_API_KEY` (optional), `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are set in your Streamlit Secrets.")
+    st.info("`GROQ_API_KEY` enables AI commentary (optional); `FRED_API_KEY` enables yield data (optional). Telegram credentials enable notifications.")
     st.markdown("- **AI Model:** Configured Groq model with Python rule-based fallback")
     st.markdown("- **Execution:** Manual trigger only (No auto-loop)")
-    st.markdown("- **Features:** Cross-event evidence council, public FRED yield-data fallback, release comparisons, multi-timeframe context, and DXY cross-checks")
+    st.markdown("- **Features:** Five-factor council, dated yield/DXY macro context, release comparisons, multi-timeframe evidence, and a weighted market-context verdict")
+    st.markdown("- **Factor weights:** Equal provisional 25% vote weights for macro, technical, liquidity, and sentiment when directional evidence exists; risk changes confidence rather than voting")
     st.markdown("- **Probabilities:** No event-scenario percentages without an empirically validated calibration set; COT/ETF sentiment is unavailable unless sourced")
     st.markdown(f"- **Minimum Confluence Score:** {MINIMUM_CONFLUENCE_SCORE}/100")
     st.markdown("- **News Signals:** Direction-only (no Entry/SL/TP)")
